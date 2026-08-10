@@ -72,6 +72,27 @@ class LocalTarget:
     d: float
     yaw_rad: float
 
+@dataclass
+class gate_Dims:
+    #dimensions of the gate
+    width_ft: float = 3     # changeable
+    height_ft: float = 3     # changeable
+
+@dataclass
+class gate_pos:
+    #pos of the gate corners
+
+    #horizontal coords
+    x1: float
+    x2: float
+
+    #height coords
+    y1: float
+    y2: float
+
+    #depth coords
+    z1: float
+    z2: float 
 
 # =========================
 # GEOMETRY / SMALL HELPERS
@@ -334,50 +355,6 @@ class NavigationController:
         )
         self.move_to_target(target, "180 Degree Turnaround")
 
-    def turn_around_90(self):
-        """Hold position and command a 180-degree yaw change."""
-        print("[*] 0 Gate Detections! Turning 90 degrees...")
-        state = self.get_vehicle_snapshot()
-        target = LocalTarget(
-            n=state.n,
-            e=state.e,
-            d=state.d,
-            yaw_rad=wrap_pi(state.yaw_rad + math.pi/2),
-        )
-        self.move_to_target(target, "90 Degree Turn")
-
-    def turn_around_45(self):
-        """Hold position and command a 180-degree yaw change."""
-        print("[*] 0 Gate Detections! Turning 45 degrees...")
-
-        state = self.get_vehicle_snapshot()
-        target = LocalTarget(
-            n=state.n,
-            e=state.e,
-            d=state.d,
-            yaw_rad=wrap_pi(state.yaw_rad + math.pi/4),
-        )
-        self.move_to_target(target, "45 Degree Turn")
-
-    def turn_around_45(self, LorR):
-        """Hold position and command a 180-degree yaw change."""
-        print("[*] 0 Gate Detections! Turning 45 degrees...")
-
-        adjust : int = 1
-        if (LorR == "left"):
-            adjust = -1
-        
-        orient = math.pi/4 * adjust
-        state = self.get_vehicle_snapshot()
-        target = LocalTarget(
-            n=state.n,
-            e=state.e,
-            d=state.d,
-            yaw_rad=wrap_pi(state.yaw_rad + orient),
-        )
-        self.move_to_target(target, "45 Degree Turn")
-    
-
     def land(self):
         """Send a land command after first stabilizing with a zero-velocity setpoint."""
         hold_yaw = self.get_vehicle_snapshot().yaw_rad
@@ -582,6 +559,7 @@ class GateMission(Mission):
             yaw_rad=gate_yaw,
         )
 
+
     def build_pass_through_target(
         self,
         nav: NavigationController,
@@ -602,3 +580,153 @@ class GateMission(Mission):
 
     def run(self, nav: NavigationController):
         raise NotImplementedError
+    
+    def find_gates(self, nav: NavigationController, duration: float = 1.0) -> Optional[GateDetection]:
+        #hovers and finds all possible gates
+        print(f"[*] Observing gates for {duration}s...")
+
+        minDist_m = 3    
+        #This records the maximum distance allowed between gate detections before they are considered new gates
+        
+        samples = []
+        t0 = time.time()
+        hold_yaw = nav.get_vehicle_snapshot().yaw_rad
+
+        while nav.running and time.time() - t0 < duration:
+            nav.send_velocity_and_yaw_target(0.0, 0.0, 0.0, hold_yaw)
+
+            det = self.get_latest_detection_snapshot()
+            if is_valid_detection(det):
+                samples.append(det)
+
+            time.sleep(0.04)
+
+        if not samples:
+            print("[!] No valid gate detections seen.")
+            return None
+
+        avgs = []
+        while(len(samples) > 0): 
+            #turns samples list into multiple averages
+            
+            sample = []
+            gateOne : GateDetection = samples[0]
+            for i in len(samples):
+                gateCurr : GateDetection = samples[i]
+                if(math.abs(gateCurr.dist - gateOne.dist) < minDist_m & 
+                   math.abs(gateCurr.forward - gateOne.forward) < minDist_m & 
+                   math.abs(gateCurr.right - gateOne.right) < minDist_m & 
+                   math.abs(gateCurr.down - gateOne.down) < minDist_m):
+                    
+                    """checks to see if the gate detections are close enough
+                    together to count as one gate"""
+
+                    sample.append(gateCurr)
+
+            for i in len(sample):
+                samples.remove(sample[i])
+            
+            #avg combines the sample items to create each gate
+            avg = GateDetection(
+            timestamp=time.time(),
+            dist=sum(d.dist for d in sample) / len(sample),
+            forward=sum(d.forward for d in sample) / len(sample),
+            right=sum(d.right for d in sample) / len(sample),
+            down=sum(d.down for d in sample) / len(sample),
+            roll=sum(d.roll for d in sample) / len(sample),
+            pitch=sum(d.pitch for d in sample) / len(sample),
+            yaw_deg=sum(d.yaw_deg for d in sample) / len(sample),)
+
+            avgs.append(avg)
+            sample.clear
+        print(f"found {len(avgs)} gates")
+        return avgs
+    
+    def adv_move_to_target(
+        self,
+        final_target: LocalTarget,
+        label: str,
+        *,
+        max_speed_m_s: float = MAX_FLIGHT_SPEED_M_S,
+        timeout_s: float = MOVE_TIMEOUT,
+    ) -> bool:
+        """Drive to a local target with per-move speed and timeout limits."""
+        if not math.isfinite(max_speed_m_s) or max_speed_m_s <= 0.0:
+            raise ValueError("max_speed_m_s must be a positive finite number")
+        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+            raise ValueError("timeout_s must be a positive finite number")
+
+        print(
+            f"[*] Moving to {label}: "
+            f"N={final_target.n:.2f}, E={final_target.e:.2f}, "
+            f"D={final_target.d:.2f}, Yaw={rad_to_deg(final_target.yaw_rad):.1f} deg, "
+            f"MaxSpeed={max_speed_m_s:.2f}m/s"
+        )
+
+
+        #idea 1
+
+        #need to get the angles included to better determine position of the square or make the
+        #system update throughout the trip
+        """gate = gate_pos(state.e + final_target.e - (gate_Dims.width_ft/2), #left of gate
+                        state.e + final_target.e + (gate_Dims.width_ft/2), #right of gate
+                        state.d + final_target.d + (gate_Dims.height_ft/2), #top of gate
+                        state.d + final_target.d - (gate_Dims.height_ft/2), #bottom of gate
+                        state.n + final_target.n - (gate_Dims.width_ft/2), #front of gate
+                        state.n + final_target.n + (gate_Dims.width_ft/2)) #back of gate"""
+        #this should map the detected gate's boundaries onto an xyz plane with the drone's start point as the origin
+
+        """while self.running:
+            state = self.get_vehicle_snapshot()
+            err_n = final_target.n - state.n
+            err_e = final_target.e - state.e
+            err_d = final_target.d - state.d
+            yaw_err = wrap_pi(final_target.yaw_rad - state.yaw_rad)
+
+            dist_xyz = math.sqrt(err_n**2 + err_e**2 + err_d**2)
+            if dist_xyz < POSITION_TOLERANCE_M and abs(rad_to_deg(yaw_err)) < YAW_TOLERANCE_DEG:
+                print(f"[*] Reached {label}")
+                self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, final_target.yaw_rad)
+                return True
+
+            if time.time() - start_time > timeout_s:
+                print(f"[!] Timeout moving to {label}. Proceeding anyway.")
+                self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, final_target.yaw_rad)
+                return False
+
+            vn = KP_POS * err_n
+            ve = KP_POS * err_e
+            vd = KP_POS * err_d
+
+            cmd_speed = math.sqrt(vn**2 + ve**2 + vd**2)
+            if cmd_speed > max_speed_m_s:
+                vn = (vn / cmd_speed) * max_speed_m_s
+                ve = (ve / cmd_speed) * max_speed_m_s
+                vd = (vd / cmd_speed) * max_speed_m_s
+
+            self.send_velocity_and_yaw_target(vn, ve, vd, final_target.yaw_rad)
+            time.sleep(period)
+
+        return False"""
+    
+        #idea 2
+
+        #get the gate_detection for the gate
+
+        #have a function that determines the route in an xyz coord plane with each variable's motion separated
+        #x^2, x, y^2, y, z^2, z, length = route_Finder(gate)
+        #
+        #while(t < maxT)
+
+
+        #idea 3
+
+        #directly control vehicle angle and thrust
+        #use inverse tangent to determine angle given the necessary thrust for the motion 
+        #and the gravitational downward force
+        #record velocity vectors for the center of each gate then make the overall path tangent to those vectors
+        #give drone max possible speed then have it determine best speed after that
+
+    def genPath(self, nav : NavigationController, ):
+        #generates path for drone
+        
