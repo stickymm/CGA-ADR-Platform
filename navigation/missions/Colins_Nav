@@ -642,13 +642,19 @@ class GateMission(Mission):
         print(f"found {len(avgs)} gates")
         return avgs
     
-    def adv_move_to_target(
+    
+    def move_to_target_curve(
         self,
         final_target: LocalTarget,
         label: str,
         *,
         max_speed_m_s: float = MAX_FLIGHT_SPEED_M_S,
         timeout_s: float = MOVE_TIMEOUT,
+        vfe: float,
+        vfn: float,
+        vfd: float,
+        v_init: float,
+        theta_f: float
     ) -> bool:
         """Drive to a local target with per-move speed and timeout limits."""
         if not math.isfinite(max_speed_m_s) or max_speed_m_s <= 0.0:
@@ -726,7 +732,168 @@ class GateMission(Mission):
         #and the gravitational downward force
         #record velocity vectors for the center of each gate then make the overall path tangent to those vectors
         #give drone max possible speed then have it determine best speed after that
+        
+        """start_time = time.time()
+        period = 1.0 / POSITION_RATE_HZ
 
+        while self.running:
+            state = self.get_vehicle_snapshot()
+            err_n = final_target.n - state.n
+            err_e = final_target.e - state.e
+            err_d = final_target.d - state.d
+            yaw_err = wrap_pi(final_target.yaw_rad - state.yaw_rad)
+
+            dist_xyz = math.sqrt(err_n**2 + err_e**2 + err_d**2)
+            if dist_xyz < POSITION_TOLERANCE_M and abs(rad_to_deg(yaw_err)) < YAW_TOLERANCE_DEG:
+                print(f"[*] Reached {label}")
+                self.send_velocity_and_yaw_target(vfn, vfe, vfd, final_target.yaw_rad)
+                return True
+
+            if time.time() - start_time > timeout_s:
+                print(f"[!] Timeout moving to {label}. Proceeding anyway.")
+                self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, final_target.yaw_rad)
+                return False
+
+            vn = KP_POS * err_n
+            ve = KP_POS * err_e
+            vd = KP_POS * err_d
+
+            cmd_speed = math.sqrt(vn**2 + ve**2 + vd**2)
+            if cmd_speed > max_speed_m_s:
+                vn = (vn / cmd_speed) * max_speed_m_s
+                ve = (ve / cmd_speed) * max_speed_m_s
+                vd = (vd / cmd_speed) * max_speed_m_s
+            
+            thetaRate = math.sqrt(vn**2 + ve**2 + vd**2) / math.abs(state.yaw_rad - final_target.yaw_rad)
+            
+            scale : int = 1000 
+            # necessary to determine how granular the motion will be, only needed if doing a for statement
+
+            while state.yaw_rad < final_target.yaw_rad:
+                self.send_velocity_and_yaw_target(vn, ve, vd, self.yaw_rad + thetaRate)
+                state = self.get_vehicle_snapshot()
+            time.sleep(period)
+
+        return False"""
+        start_time = time.time()
+        period = 1.0 / POSITION_RATE_HZ
+
+        state = self.get_vehicle_snapshot()
+
+        err_n = final_target.n - state.n
+        err_e = final_target.e - state.e
+        err_d = final_target.d - state.d
+        dist_xyz = math.sqrt(err_n**2 + err_e**2 + err_d**2)
+
+        d_theta = math.abs(state.yaw_rad - final_target.yaw_rad)
+        radius = (dist_xyz * math.sin(90-d_theta/2)) / math.sin(d_theta)
+        arc_len = math.pi * radius * d_theta / 180
+
+        vn = KP_POS * err_n
+        ve = KP_POS * err_e
+        vd = KP_POS * err_d
+
+        cmd_speed = math.sqrt(vn**2 + ve**2 + vd**2)
+        if cmd_speed > max_speed_m_s:
+            vn = (vn / cmd_speed) * max_speed_m_s
+            ve = (ve / cmd_speed) * max_speed_m_s
+            vd = (vd / cmd_speed) * max_speed_m_s
+        
+        Time = arc_len / math.sqrt(vn**2 + ve**2 + vd**2)
+        omega = d_theta / Time
+
+        theta_rate = omega / period # how much the current yaw angle is adjusted each cycle
+
+        while self.running:
+            state = self.get_vehicle_snapshot()
+            err_n = final_target.n - state.n
+            err_e = final_target.e - state.e
+            err_d = final_target.d - state.d
+            yaw_err = wrap_pi(final_target.yaw_rad - state.yaw_rad)
+
+            dist_xyz = math.sqrt(err_n**2 + err_e**2 + err_d**2)
+            if dist_xyz < POSITION_TOLERANCE_M and abs(rad_to_deg(yaw_err)) < YAW_TOLERANCE_DEG:
+                print(f"[*] Reached {label}")
+                self.send_velocity_and_yaw_target(vfn, vfd, vfe, theta_f)
+                return True
+
+            if time.time() - start_time > timeout_s:
+                print(f"[!] Timeout moving to {label}. Proceeding anyway.")
+                self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, final_target.yaw_rad)
+                return False
+
+            self.send_velocity_and_yaw_target(vn, ve, vd, state.yaw_rad + theta_rate)
+            time.sleep(period)
+
+        return False
+
+
+    
+    def adv_move_to_target(
+        self,
+        final_target: LocalTarget,
+        label: str,
+        *,
+        max_speed_m_s: float = MAX_FLIGHT_SPEED_M_S,
+        timeout_s: float = MOVE_TIMEOUT,
+        vfn: float,
+        vfe: float,
+        vfd: float,
+        theta_f: float
+    ) -> bool:
+        """Drive to a local target with per-move speed and timeout limits."""
+        if not math.isfinite(max_speed_m_s) or max_speed_m_s <= 0.0:
+            raise ValueError("max_speed_m_s must be a positive finite number")
+        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+            raise ValueError("timeout_s must be a positive finite number")
+
+        print(
+            f"[*] Moving to {label}: "
+            f"N={final_target.n:.2f}, E={final_target.e:.2f}, "
+            f"D={final_target.d:.2f}, Yaw={rad_to_deg(final_target.yaw_rad):.1f} deg, "
+            f"MaxSpeed={max_speed_m_s:.2f}m/s"
+        )
+
+        start_time = time.time()
+        period = 1.0 / POSITION_RATE_HZ
+
+        while self.running:
+            state = self.get_vehicle_snapshot()
+            err_n = final_target.n - state.n
+            err_e = final_target.e - state.e
+            err_d = final_target.d - state.d
+            yaw_err = wrap_pi(final_target.yaw_rad - state.yaw_rad)
+
+            dist_xyz = math.sqrt(err_n**2 + err_e**2 + err_d**2)
+            if dist_xyz < POSITION_TOLERANCE_M and abs(rad_to_deg(yaw_err)) < YAW_TOLERANCE_DEG:
+                print(f"[*] Reached {label}")
+                self.send_velocity_and_yaw_target(vfn, vfe, vfd, theta_f)
+                return True
+
+            if time.time() - start_time > timeout_s:
+                print(f"[!] Timeout moving to {label}. Proceeding anyway.")
+                self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, final_target.yaw_rad)
+                return False
+
+            vn = KP_POS * err_n
+            ve = KP_POS * err_e
+            vd = KP_POS * err_d
+
+            cmd_speed = math.sqrt(vn**2 + ve**2 + vd**2)
+            if cmd_speed > max_speed_m_s:
+                vn = (vn / cmd_speed) * max_speed_m_s
+                ve = (ve / cmd_speed) * max_speed_m_s
+                vd = (vd / cmd_speed) * max_speed_m_s
+
+            self.send_velocity_and_yaw_target(vn, ve, vd, final_target.yaw_rad)
+            time.sleep(period)
+
+        return False
+    
     def genPath(self, nav : NavigationController, ):
         #generates path for drone
-        
+        print("hi")
+
+    def runPath():
+        #should know all the calculations and do them first before then giving each function its start and end values
+        print("hi")
