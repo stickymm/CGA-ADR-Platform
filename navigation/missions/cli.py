@@ -61,6 +61,14 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     offline.add_argument("--offline-wind-e", type=float, default=0.0)
     offline.add_argument("--offline-latency-s", type=float, default=0.0)
     offline.add_argument("--offline-arm-delay-s", type=float, default=2.0)
+    offline.add_argument(
+        "--offline-tilt",
+        action="store_true",
+        help="model roll/pitch from horizontal acceleration, which exercises the "
+             "full 3-2-1 rotation. The injector emits vehicle-frame poses and "
+             "cannot compensate, so expect the gate estimate to shift while "
+             "accelerating -- that is the point, not a bug",
+    )
 
     flight = parser.add_argument_group("flight envelope")
     flight.add_argument("--takeoff-altitude-m", type=float, default=1.5)
@@ -80,10 +88,31 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     gate.add_argument("--exit-clearance-m", type=float, default=0.8)
     gate.add_argument("--observation-duration-s", type=float, default=0.5)
     gate.add_argument("--max-detection-age-s", type=float, default=0.4)
+    gate.add_argument(
+        "--arrival-tolerance-m",
+        type=float,
+        default=0.15,
+        help="how close a move must get before it counts as arrived. Must be "
+             "smaller than --step-size-m. 0.10 m is inside the noise floor of "
+             "an optical-flow position estimate",
+    )
+    gate.add_argument(
+        "--frozen-feed-frames",
+        type=int,
+        default=15,
+        help="identical vision payloads before the feed is declared frozen",
+    )
 
     limits = parser.add_argument_group("limits and recovery")
     limits.add_argument("--max-approach-attempts", type=int, default=14)
-    limits.add_argument("--approach-timeout-s", type=float, default=75.0)
+    limits.add_argument("--approach-timeout-s", type=float, default=90.0)
+    limits.add_argument(
+        "--max-yaw-rate-deg-s",
+        type=float,
+        default=45.0,
+        help="commanded yaw rate for searches and turns. Do not rely on PX4's "
+             "MPC_YAWRAUTO_MAX for this -- fast yaw degrades optical flow",
+    )
     limits.add_argument("--max-observe-retries", type=int, default=3)
     limits.add_argument("--max-scan-sweeps", type=int, default=2)
     limits.add_argument("--scan-half-angle-deg", type=float, default=45.0)
@@ -161,10 +190,12 @@ def build_leg_config(args, envelope: AltitudeEnvelope) -> GateLegConfig:
         cross_speed_m_s=args.cross_speed_m_s,
         max_observe_retries=args.max_observe_retries,
         scan_half_angle_deg=args.scan_half_angle_deg,
+        max_yaw_rate_deg_s=args.max_yaw_rate_deg_s,
         max_scan_sweeps=args.max_scan_sweeps,
         backoff_distance_m=args.backoff_distance_m,
         max_backoffs=args.max_backoffs,
         max_detection_age_s=args.max_detection_age_s,
+        arrival_tolerance_m=args.arrival_tolerance_m,
         altitude=envelope,
     )
 
@@ -187,6 +218,7 @@ def build_controller(args) -> NavigationController:
             wind_ned=(args.offline_wind_n, args.offline_wind_e, 0.0),
             latency_s=args.offline_latency_s,
             arm_delay_s=args.offline_arm_delay_s,
+            model_tilt=args.offline_tilt,
         )
     return NavigationController(args.mavlink, dry_run=args.dry_run)
 
@@ -197,6 +229,7 @@ def build_mission(args) -> DetectionOnlyMission:
         cam_offset_down_m=args.camera_down_offset_m,
         cam_yaw_offset_deg=args.camera_yaw_offset_deg,
         detection_max_age_s=args.max_detection_age_s,
+        frozen_feed_frames=args.frozen_feed_frames,
     )
 
 

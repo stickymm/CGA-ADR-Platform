@@ -30,6 +30,7 @@ from ..navigation import (
     MAV_MODE_FLAG_SAFETY_ARMED,
     PX4_CUSTOM_MAIN_MODE_OFFBOARD,
     NavigationController,
+    NullLink,
     Setpoint,
     SetpointKind,
     VehicleState,
@@ -41,6 +42,8 @@ SIM_MAX_YAW_RATE_RAD_S = math.radians(45.0)
 SIM_ALTITUDE_KP = 1.2
 SIM_LANDING_SPEED_M_S = 0.5
 SIM_IN_AIR_ALT_M = 0.25
+SIM_GRAVITY_M_S2 = 9.80665
+SIM_MAX_TILT_RAD = math.radians(35.0)
 
 
 class OfflineNavigationController(NavigationController):
@@ -55,6 +58,7 @@ class OfflineNavigationController(NavigationController):
         arm_delay_s: float = 2.0,
         start_d: float = 0.0,
         start_yaw_rad: float = 0.0,
+        model_tilt: bool = False,
     ):
         super().__init__("offline://none", dry_run=False)
 
@@ -67,6 +71,17 @@ class OfflineNavigationController(NavigationController):
         self.wind_ned = wind_ned
         self.latency_s = latency_s
         self.arm_delay_s = arm_delay_s
+        # OFF BY DEFAULT, on purpose.  A multirotor tilts to accelerate, so
+        # modelling attitude is more realistic -- but the injector publishes
+        # gate poses in the VEHICLE frame with no idea that the vehicle is
+        # tilted, so switching this on makes the synthetic detections and the
+        # synthetic attitude disagree.  That is exactly what you want when
+        # exercising the 3-2-1 rotation path (`--offline-tilt`), and exactly what
+        # you do not want when checking Phase 1 sequencing.
+        self.model_tilt = model_tilt
+        # Nothing to transmit to, but the controller's senders still go through
+        # a link.  See navigation.NullLink for why this is not a DryRunLink.
+        self.link = NullLink()
 
         self._sim_lock = threading.Lock()
         self._sim_n = 0.0
@@ -76,6 +91,8 @@ class OfflineNavigationController(NavigationController):
         self._sim_vn = 0.0
         self._sim_ve = 0.0
         self._sim_vd = 0.0
+        self._sim_roll = 0.0
+        self._sim_pitch = 0.0
         self._ground_d = start_d
 
         self._sim_armed = False
@@ -198,6 +215,7 @@ class OfflineNavigationController(NavigationController):
                     self._sim_n, self._sim_e, self._sim_d, self._sim_yaw,
                     self._sim_vn, self._sim_ve, self._sim_vd,
                     self._sim_armed, self._sim_offboard,
+                    self._sim_roll, self._sim_pitch,
                 )
 
             self._publish_state(pose)
@@ -232,9 +250,12 @@ class OfflineNavigationController(NavigationController):
         # First-order lag towards the commanded velocity.  Without this every
         # move completes instantly and the timeout logic is never exercised.
         alpha = 1.0 if self.lag_s <= 0.0 else min(1.0, dt / self.lag_s)
+        previous_vn, previous_ve = self._sim_vn, self._sim_ve
         self._sim_vn += (target_vn - self._sim_vn) * alpha
         self._sim_ve += (target_ve - self._sim_ve) * alpha
         self._sim_vd += (target_vd - self._sim_vd) * alpha
+
+        self._update_tilt(previous_vn, previous_ve, dt)
 
         self._sim_n += (self._sim_vn + self.wind_ned[0]) * dt
         self._sim_e += (self._sim_ve + self.wind_ned[1]) * dt
@@ -255,8 +276,39 @@ class OfflineNavigationController(NavigationController):
             self._sim_armed = False
             self._sim_offboard = False
 
+    def _update_tilt(self, previous_vn: float, previous_ve: float, dt: float) -> None:
+        """Derive roll and pitch from horizontal acceleration.
+
+        A multirotor has no other way to accelerate: it tilts, and the horizontal
+        component of thrust is what moves it.  For small angles
+
+            pitch = -atan2(a_forward, g)      nose down to accelerate forward
+            roll  = +atan2(a_right,   g)      right side down to accelerate right
+
+        with the accelerations rotated into the body frame first.  This is the
+        only place the offline model produces a non-level attitude, and it is the
+        only way an offline run exercises the pitch/roll terms of the 3-2-1
+        rotation at all.
+        """
+        if not self.model_tilt or dt <= 0.0:
+            self._sim_roll = 0.0
+            self._sim_pitch = 0.0
+            return
+
+        accel_n = (self._sim_vn - previous_vn) / dt
+        accel_e = (self._sim_ve - previous_ve) / dt
+
+        cos_yaw, sin_yaw = math.cos(self._sim_yaw), math.sin(self._sim_yaw)
+        accel_forward = cos_yaw * accel_n + sin_yaw * accel_e
+        accel_right = -sin_yaw * accel_n + cos_yaw * accel_e
+
+        pitch = -math.atan2(accel_forward, SIM_GRAVITY_M_S2)
+        roll = math.atan2(accel_right, SIM_GRAVITY_M_S2)
+        self._sim_pitch = max(-SIM_MAX_TILT_RAD, min(SIM_MAX_TILT_RAD, pitch))
+        self._sim_roll = max(-SIM_MAX_TILT_RAD, min(SIM_MAX_TILT_RAD, roll))
+
     def _publish_state(self, pose):
-        n, e, d, yaw, vn, ve, vd, armed, offboard = pose
+        n, e, d, yaw, vn, ve, vd, armed, offboard, roll, pitch = pose
 
         if self.latency_s > 0.0:
             time.sleep(0.0)  # latency is modelled by the stamp below, not a sleep
@@ -268,11 +320,20 @@ class OfflineNavigationController(NavigationController):
             self._vehicle.n, self._vehicle.e, self._vehicle.d = n, e, d
             self._vehicle.vn, self._vehicle.ve, self._vehicle.vd = vn, ve, vd
             self._vehicle.yaw_rad = yaw
+            self._vehicle.roll_rad = roll
+            self._vehicle.pitch_rad = pitch
             self._vehicle.have_local_position = True
             self._vehicle.have_attitude = True
             self._vehicle.position_received_s = stamp
             self._vehicle.attitude_received_s = stamp
             self._vehicle.heartbeat_received_s = stamp
+            # A healthy simulated estimator, so estimator_note() reads
+            # "estimator healthy" offline instead of "never seen".
+            self._vehicle.estimator_flags = 0xFFFF
+            self._vehicle.estimator_vel_ratio = 0.1
+            self._vehicle.estimator_pos_horiz_ratio = 0.1
+            self._vehicle.estimator_hagl_ratio = 0.1
+            self._vehicle.estimator_received_s = stamp
             self._vehicle.armed = armed
             self._vehicle.base_mode = (
                 MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
@@ -282,3 +343,7 @@ class OfflineNavigationController(NavigationController):
                 PX4_CUSTOM_MAIN_MODE_OFFBOARD << 16 if offboard else 0
             )
             self._vehicle.landed_state = 2 if altitude > SIM_IN_AIR_ALT_M else 1
+
+        # Feed the deskew ring buffer, which the real controller fills from the
+        # LOCAL_POSITION_NED branch of its reader thread.
+        self._record_history(self.get_vehicle_snapshot())

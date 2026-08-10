@@ -148,7 +148,18 @@ class GateLegConfig:
     approach_speed_m_s: float = 0.35
     observation_duration_s: float = 0.5
     max_approach_attempts: int = 14
-    approach_timeout_s: float = 75.0
+    # 90 s, not 75 s -- see attempt_budget_s() below and the MOVE_TIMEOUT note in
+    # navigation.py. 75 s could not actually deliver the 14 attempts this config
+    # advertises; the numbers now agree with each other by construction.
+    approach_timeout_s: float = 90.0
+
+    # Arrival tolerance for the approach steps of this leg.  Separate from the
+    # commit tolerances on purpose: this one asks "did the vehicle finish the
+    # move", which is limited by what optical flow can resolve, while the commit
+    # tolerances ask "is the gate on the boresight", which is measured directly
+    # by the camera and is far better observed.  Loosening this one does not
+    # loosen the decision to fly at a gate.
+    arrival_tolerance_m: float = 0.15
 
     # --- commit gate (range AND alignment AND not edge-on) ---
     commit_lateral_tol_m: float = 0.20
@@ -165,6 +176,10 @@ class GateLegConfig:
     # --- search / recovery ladder ---
     max_observe_retries: int = 3
     scan_half_angle_deg: float = 45.0
+    # Commanded yaw rate for every deliberate heading change. PX4's
+    # MPC_YAWRAUTO_MAX is a backstop that an airframe startup script can raise
+    # without anyone noticing; this is the number this code actually controls.
+    max_yaw_rate_deg_s: float = 45.0
     max_scan_sweeps: int = 2
     backoff_distance_m: float = 1.0
     max_backoffs: int = 2
@@ -190,9 +205,20 @@ class GateLegConfig:
             "max_detection_age_s": self.max_detection_age_s,
             "max_telemetry_age_s": self.max_telemetry_age_s,
         }
+        positive["arrival_tolerance_m"] = self.arrival_tolerance_m
         for name, value in positive.items():
             if not value > 0.0:
                 raise ValueError(f"{name} must be positive, got {value!r}")
+
+        # An arrival tolerance at or above the step size makes every approach
+        # step arrive before it moves, so the drone would "approach" the gate by
+        # standing still and announcing success.
+        if self.arrival_tolerance_m >= self.step_size_m:
+            raise ValueError(
+                f"arrival_tolerance_m ({self.arrival_tolerance_m:.2f} m) must be "
+                f"smaller than step_size_m ({self.step_size_m:.2f} m), or every "
+                f"approach step arrives without moving"
+            )
 
         if not 0.0 < self.commit_max_cone_deg < 90.0:
             raise ValueError("commit_max_cone_deg must be in (0, 90)")
@@ -202,6 +228,78 @@ class GateLegConfig:
             raise ValueError("max_approach_attempts must be at least 1")
         if self.exit_clearance_m >= self.pass_distance_m:
             raise ValueError("exit_clearance_m must be less than pass_distance_m")
+
+
+def attempt_move_budget_s(cfg: GateLegConfig) -> float:
+    """Worst-case time budget one approach step can consume, in seconds.
+
+    Mirrors what ``move_to_target`` will actually compute for a full-size step:
+    the distance-derived estimate, floored by ``MOVE_TIMEOUT``.  Imported lazily
+    so this module keeps its "no I/O, no imports that pull in pymavlink" property
+    for the tests that stub the driver out.
+    """
+    from ..navigation import estimate_move_timeout
+
+    return estimate_move_timeout(
+        cfg.step_size_m,
+        cfg.approach_speed_m_s,
+        tolerance_m=cfg.arrival_tolerance_m,
+    )
+
+
+def attempt_budget_s(cfg: GateLegConfig) -> float:
+    """Wall clock the config's advertised approach attempts actually need.
+
+    One attempt is an observation window plus one bounded move, so::
+
+        attempts * (observation_duration_s + worst-case move budget)
+
+    THIS IS THE ARITHMETIC THAT WAS INCONSISTENT.  With the old numbers -- a
+    0.10 m arrival tolerance inside the flow noise floor, a 15 s move floor, and
+    a 75 s gate deadline -- a 0.25 m step was issued with a 15 s budget it
+    routinely spent in full, so the deadline bought about 5 attempts against a
+    config whose banner promised 14.  Nothing in the code noticed, because no
+    single number was wrong on its own; only the relationship between them was.
+
+    It is a *lower bound* on what the deadline needs: the recovery ladder (yaw
+    sweeps, back-offs) draws on the same deadline, so a healthy margin is
+    expected on top.
+    """
+    return cfg.max_approach_attempts * (
+        cfg.observation_duration_s + attempt_move_budget_s(cfg)
+    )
+
+
+def deadline_consistency(cfg: GateLegConfig) -> Tuple[str, ...]:
+    """Human-readable complaints about tolerance/timeout/deadline disagreement.
+
+    Returned rather than raised: a short ``--approach-timeout-s`` is a legitimate
+    thing to want on a bench, and refusing to run would be worse than saying so.
+    The pre-flight banner prints whatever comes back, so a mis-tuned set of flags
+    is visible before the props spin rather than inferred from a log afterwards.
+    """
+    complaints = []
+    needed = attempt_budget_s(cfg)
+    if needed > cfg.approach_timeout_s:
+        reachable = max(
+            1,
+            int(
+                cfg.approach_timeout_s
+                / (cfg.observation_duration_s + attempt_move_budget_s(cfg))
+            ),
+        )
+        complaints.append(
+            f"approach_timeout_s={cfg.approach_timeout_s:.0f}s cannot deliver the "
+            f"{cfg.max_approach_attempts} attempts advertised (needs {needed:.0f}s); "
+            f"about {reachable} are actually reachable"
+        )
+    if cfg.arrival_tolerance_m > cfg.commit_lateral_tol_m:
+        complaints.append(
+            f"arrival_tolerance_m={cfg.arrival_tolerance_m:.2f}m is looser than "
+            f"commit_lateral_tol_m={cfg.commit_lateral_tol_m:.2f}m, so a step can "
+            f"'arrive' outside the commit gate and never converge"
+        )
+    return tuple(complaints)
 
 
 def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
@@ -214,6 +312,7 @@ def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
         ("commit max cone", f"{cfg.commit_max_cone_deg:.1f} deg"),
         ("commit confirm frames", f"{cfg.commit_confirm_frames}"),
         ("approach step", f"{cfg.step_size_m:.2f} m"),
+        ("arrival tolerance", f"{cfg.arrival_tolerance_m:.2f} m"),
         ("approach speed", f"{cfg.approach_speed_m_s:.2f} m/s"),
         ("cross speed", f"{cfg.cross_speed_m_s:.2f} m/s"),
         ("pass distance", f"{cfg.pass_distance_m:.2f} m"),
@@ -225,7 +324,12 @@ def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
         ("altitude envelope", f"{env.min_alt_m:.2f} - {env.max_alt_m:.2f} m AGL"),
         ("approach attempts", f"{cfg.max_approach_attempts}"),
         ("approach timeout", f"{cfg.approach_timeout_s:.0f} s"),
+        ("attempt budget", f"{attempt_budget_s(cfg):.0f} s needed for "
+                           f"{cfg.max_approach_attempts} attempts "
+                           f"({attempt_move_budget_s(cfg):.1f} s per move)"),
         ("recovery ladder", f"observe x{cfg.max_observe_retries}, "
                             f"scan +/-{cfg.scan_half_angle_deg:.0f}deg x{cfg.max_scan_sweeps}, "
                             f"backoff {cfg.backoff_distance_m:.2f}m x{cfg.max_backoffs}"),
+    ) + tuple(
+        ("!! INCONSISTENT", complaint) for complaint in deadline_consistency(cfg)
     )

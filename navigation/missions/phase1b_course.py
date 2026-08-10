@@ -35,7 +35,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from .cli import add_common_arguments, build, check_mode_flags
 from .contracts import GateLegConfig, GateOutcome, GateResult, summarize_config
@@ -108,11 +108,18 @@ def run(
     leg_cfg: GateLegConfig,
     pad_cfg: PadConfig,
     course_cfg: CourseConfig,
+    results: Optional[List[GateOutcome]] = None,
 ) -> int:
-    """The whole course, in order.  Returns a process exit code."""
+    """The whole course, in order.  Returns a process exit code.
+
+    ``results`` is accepted from the caller so that an interrupt unwinding out
+    of this function still has the per-gate outcomes to report.  When it was
+    local, Ctrl-C after two crossed gates printed "no gates were attempted".
+    """
 
     started_s = time.time()
-    results: List[GateOutcome] = []
+    if results is None:
+        results = []
     crossed = 0
     consecutive_failures = 0
 
@@ -270,13 +277,20 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
+    # Owned here, not inside run(), so an interrupt still reports which gates
+    # were flown. `crossed` is recomputed from the outcomes for the same reason.
+    results: List[GateOutcome] = []
+
+    def crossed_count() -> int:
+        return sum(1 for outcome in results if outcome.result is GateResult.CROSSED)
+
     mission.start()
     try:
-        return run(nav, mission, leg_cfg, pad_cfg, course_cfg)
+        return run(nav, mission, leg_cfg, pad_cfg, course_cfg, results)
     except KeyboardInterrupt:
-        return _abort(nav, "operator interrupt", [], 0)
+        return _abort(nav, "operator interrupt", results, crossed_count())
     except Exception as exc:  # never leave the aircraft flying because of a bug here
-        return _abort(nav, f"unhandled error: {exc!r}", [], 0)
+        return _abort(nav, f"unhandled error: {exc!r}", results, crossed_count())
     finally:
         mission.stop()
         nav.stop()

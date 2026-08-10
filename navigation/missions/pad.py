@@ -26,7 +26,7 @@ until OFFBOARD has been confirmed, and :func:`assert_not_climbing` checks it.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
 
 from ..navigation import (
@@ -47,7 +47,10 @@ class PadConfig:
     min_position_rate_hz: float = 15.0
     min_attitude_rate_hz: float = 20.0
     telemetry_measure_s: float = 3.0
-    detection_wait_s: float = 5.0
+    detection_wait_s: float = 6.0
+    # How long the feed must keep *changing* before it counts as alive. Must
+    # comfortably exceed frozen_feed_frames / publisher fps (15/30 = 0.5 s).
+    detection_observe_s: float = 1.0
     arm_wait_s: float = 300.0
     offboard_timeout_s: float = 10.0
     takeoff_timeout_s: float = 20.0
@@ -118,31 +121,62 @@ def wait_for_detections(
     nav: NavigationController,
     wait_s: float,
     log: LogFn = print,
+    *,
+    min_observe_s: float = 1.0,
 ) -> bool:
     """Confirm the vision process is alive and its detections are fresh.
 
-    Distinguishes the three cases the old code conflated: no packets at all
+    Distinguishes the four cases the old code conflated: no packets at all
     (vision is dead or the port is wrong), packets carrying only the 999
-    no-detection sentinel (normal, no gate in view), and fresh real detections.
+    no-detection sentinel (normal, no gate in view), packets carrying a gate
+    whose pose never changes (a stalled camera -- the failure that looks exactly
+    like health), and fresh real detections.
+
+    Refusing to take off on a frozen feed is the whole point of checking it here:
+    airborne, the same condition costs a recovery ladder and a gate.
     """
     deadline = time.time() + wait_s
     saw_packet = False
+    first_fresh_s = None
+    latest = None
 
     while nav.running and time.time() < deadline:
+        if getattr(mission, "feed_frozen", False):
+            log(
+                f"[!] Vision feed is FROZEN: {mission.identical_frame_count} identical "
+                f"payloads in a row. The publisher is alive but its pose is not "
+                f"changing -- a stalled camera or a wedged pipeline. Refusing."
+            )
+            return False
+
         det = mission.get_latest_detection_snapshot()
         if det is not None:
             saw_packet = True
             age = time.time() - det.timestamp
             if age <= mission.detection_max_age_s:
-                log(
-                    f"[*] Vision feed alive: fwd={det.forward:+.2f}m "
-                    f"right={det.right:+.2f}m down={det.down:+.2f}m "
-                    f"yaw={det.yaw_deg:+.1f}deg dist={det.dist:.2f}m (age {age*1000:.0f}ms)"
-                )
-                return True
-        time.sleep(0.1)
+                latest = det
+                if first_fresh_s is None:
+                    first_fresh_s = time.time()
+                # Watch for a full frozen-detection window before declaring the
+                # feed healthy. Returning on the first fresh packet would pass a
+                # stalled camera every time -- it publishes fresh packets, they
+                # just all say the same thing.
+                elif time.time() - first_fresh_s >= min_observe_s:
+                    log(
+                        f"[*] Vision feed alive and CHANGING over {min_observe_s:.1f}s: "
+                        f"fwd={latest.forward:+.2f}m right={latest.right:+.2f}m "
+                        f"down={latest.down:+.2f}m yaw={latest.yaw_deg:+.1f}deg "
+                        f"dist={latest.dist:.2f}m (age {age*1000:.0f}ms)"
+                    )
+                    return True
+        time.sleep(0.05)
 
-    if saw_packet:
+    if first_fresh_s is not None:
+        log(
+            f"[!] Vision feed produced fresh detections but not for the full "
+            f"{min_observe_s:.1f}s freshness window inside the {wait_s:.1f}s budget."
+        )
+    elif saw_packet:
         log("[!] Vision packets are arriving but every one is stale or a no-detection row.")
     else:
         log(f"[!] No vision packets on UDP {mission.udp_ip}:{mission.udp_port}.")
@@ -196,7 +230,13 @@ def run_pad_sequence(
 
     # --- 3. vision ----------------------------------------------------------
     log("\n[STEP 3] Checking the vision feed")
-    if not wait_for_detections(mission, nav, cfg.detection_wait_s, log=log):
+    if not wait_for_detections(
+        mission,
+        nav,
+        cfg.detection_wait_s,
+        log=log,
+        min_observe_s=cfg.detection_observe_s,
+    ):
         if cfg.require_detections:
             return PadResult(False, "no fresh gate detections before takeoff")
         log("[!] Continuing without detections because --allow-no-detections was set")

@@ -108,7 +108,18 @@ def approach_and_cross_one_gate(
         if not nav.telemetry_ok(cfg.max_telemetry_age_s):
             return finish(
                 GateResult.ABORTED,
-                f"telemetry older than {cfg.max_telemetry_age_s:.2f}s",
+                f"telemetry older than {cfg.max_telemetry_age_s:.2f}s"
+                + nav.estimator_note(),
+            )
+        if not nav.get_vehicle_snapshot().in_offboard:
+            # PX4 sets `offboard_control_signal_lost` when the ESTIMATOR fails
+            # its velocity innovation check past COM_VEL_FS_EVH, so the obvious
+            # reading of this message -- "the companion link dropped" -- is
+            # wrong about as often as it is right on a flow-only airframe.
+            # estimator_note() says which one it actually was.
+            return finish(
+                GateResult.ABORTED,
+                "PX4 is no longer in OFFBOARD" + nav.estimator_note(),
             )
         if attempts >= cfg.max_approach_attempts:
             return finish(
@@ -144,6 +155,7 @@ def approach_and_cross_one_gate(
                     ),
                     f"gate {gate_index} back-off",
                     max_speed_m_s=cfg.approach_speed_m_s,
+                    tolerance_m=cfg.arrival_tolerance_m,
                 )
                 continue
 
@@ -212,7 +224,10 @@ def approach_and_cross_one_gate(
         desired = standoff_target(fix, standoff_m, envelope)
         stepped = limit_target_step(state, desired, cfg.step_size_m)
         if not nav.move_to_target(
-            stepped, label, max_speed_m_s=cfg.approach_speed_m_s
+            stepped,
+            label,
+            max_speed_m_s=cfg.approach_speed_m_s,
+            tolerance_m=cfg.arrival_tolerance_m,
         ):
             log(f"[!] Move '{label}' did not complete; re-observing before retrying")
 
@@ -246,10 +261,16 @@ def _log_fix(fix: GateFix, state, gate_index: int, attempt: int, envelope, log: 
 def _yaw_sweep(nav: NavigationController, cfg: GateLegConfig, *, log: LogFn = print) -> None:
     """Sweep the nose either side of its current heading, looking for the gate.
 
-    Rate-limited on purpose.  On an optical-flow airframe a fast yaw injects
-    rotation-induced flow that the estimator has to cancel with gyro data, and
-    degrading the position estimate during a *recovery* would be exactly the
-    wrong trade.
+    Rate-limited on purpose, and now actually rate-limited by *this* code rather
+    than by hoping PX4's ``MPC_YAWRAUTO_MAX`` is still at its default.  On an
+    optical-flow airframe a fast yaw injects rotation-induced flow that the
+    estimator has to cancel with gyro data alone, and degrading the position
+    estimate during a *recovery* would be exactly the wrong trade.
+
+    The previous version issued each +/-45 degree step as a single
+    ``move_to_target`` with a new absolute yaw, i.e. "turn there as fast as you
+    like".  ``slew_yaw`` ramps the commanded heading at
+    ``cfg.max_yaw_rate_deg_s`` instead.
     """
     state = nav.get_vehicle_snapshot()
     half = math.radians(cfg.scan_half_angle_deg)
@@ -257,13 +278,11 @@ def _yaw_sweep(nav: NavigationController, cfg: GateLegConfig, *, log: LogFn = pr
     for offset in (+half, -half, 0.0):
         if not nav.running:
             return
-        target = LocalTarget(
-            n=state.n, e=state.e, d=state.d, yaw_rad=wrap_pi(state.yaw_rad + offset)
-        )
-        nav.move_to_target(
-            target,
-            f"scan to {math.degrees(wrap_pi(state.yaw_rad + offset)):+.0f}deg",
-            max_speed_m_s=cfg.approach_speed_m_s,
+        heading = wrap_pi(state.yaw_rad + offset)
+        nav.slew_yaw(
+            heading,
+            label=f"scan to {math.degrees(heading):+.0f}deg",
+            max_rate_deg_s=cfg.max_yaw_rate_deg_s,
         )
 
 

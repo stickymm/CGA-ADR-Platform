@@ -27,6 +27,7 @@ from ..navigation import (
     GateDetection,
     LocalTarget,
     VehicleState,
+    body_to_local,
     wrap_pi,
     deg_to_rad,
     rad_to_deg,
@@ -54,25 +55,26 @@ def rotate_body_to_ned(
           [ -sp     cp*sr              cp*cr            ]
 
     With ``roll = pitch = 0`` this collapses exactly to the planar yaw-only
-    rotation that :func:`navigation.navigation.body_to_local` performs, which is
-    asserted in the tests -- so adopting full attitude cannot silently change
-    any existing behaviour when the vehicle is level.
+    rotation the legacy missions perform, which is asserted in the tests -- so
+    adopting full attitude cannot silently change any existing behaviour when the
+    vehicle is level.
 
     The correction matters: a gate 3 m ahead observed at 10 degrees of body pitch
     is mis-placed vertically by ``3 * sin(10 deg) = 0.52 m`` if pitch is ignored,
     and that error feeds straight into the commanded altitude.
 
+    IMPLEMENTATION NOTE
+        This is a keyword-friendly alias of
+        :func:`navigation.navigation.body_to_local`, which now carries the 3-2-1
+        matrix itself.  There is deliberately only **one** copy of the rotation
+        in the repo: two copies of a rotation matrix is how the legacy missions
+        ended up with a different frame convention from the Phase 1 stack in the
+        first place.
+
     Returns:
         ``(dn, de, dd)`` -- the displacement in local NED, metres.
     """
-    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
-    cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
-    cr, sr = math.cos(roll_rad), math.sin(roll_rad)
-
-    dn = (cy * cp) * forward + (cy * sp * sr - sy * cr) * right + (cy * sp * cr + sy * sr) * down
-    de = (sy * cp) * forward + (sy * sp * sr + cy * cr) * right + (sy * sp * cr - cy * sr) * down
-    dd = (-sp) * forward + (cp * sr) * right + (cp * cr) * down
-    return dn, de, dd
+    return body_to_local(forward, right, down, yaw_rad, pitch_rad, roll_rad)
 
 
 def circular_mean_deg(values: Iterable[float]) -> float:

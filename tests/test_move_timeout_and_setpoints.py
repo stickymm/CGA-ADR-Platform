@@ -41,6 +41,10 @@ class MoveTimeoutTests(unittest.TestCase):
         # The leg that always failed in the old course mission: 1.0 m standoff
         # plus 1.5 m beyond the gate = 2.5 m, flown at 0.15 m/s.
         #
+        # Pinned at the ORIGINAL 0.10 m tolerance so the arithmetic below stays
+        # the hand-derived arithmetic it was checked against, independently of
+        # what the default tolerance is today.
+        #
         # The speed clamp binds while error > max_speed / KP_POS = 0.15 / 1.2
         #                                                        = 0.125 m
         #   constant-speed run: (2.5 - 0.125) / 0.15 = 2.375 / 0.15 = 15.833333 s
@@ -49,23 +53,59 @@ class MoveTimeoutTests(unittest.TestCase):
         #   ideal total                                            = 16.019286 s
         #   plus a 3.0 s margin at unity scale                     = 19.019286 s
         self.assertAlmostEqual(KP_POS, 1.2, places=9)
-        self.assertAlmostEqual(POSITION_TOLERANCE_M, 0.10, places=9)
+
+        budget = estimate_move_timeout(
+            2.5, 0.15, tolerance_m=0.10, margin_s=3.0, scale=1.0
+        )
+        self.assertAlmostEqual(budget, 19.019286, places=5)
+
+    def test_the_hand_derived_budget_at_the_current_default_tolerance(self):
+        # Same leg at the tolerance actually in force (0.15 m -- see the comment
+        # on POSITION_TOLERANCE_M for why 0.10 m was inside the flow noise
+        # floor). Only the exponential tail changes:
+        #   exponential tail: ln(0.125 / 0.15) / 1.2
+        #                   = -0.18232156 / 1.2 = -0.15193463 s
+        # i.e. the tolerance is already wider than the knee, so the decay phase
+        # is over before it starts and the run phase alone covers the move.
+        #   ideal total  = 15.833333 - 0.151935 = 15.681399 s
+        #   plus margin                          = 18.681399 s
+        self.assertAlmostEqual(POSITION_TOLERANCE_M, 0.15, places=9)
 
         budget = estimate_move_timeout(2.5, 0.15, margin_s=3.0, scale=1.0)
-        self.assertAlmostEqual(budget, 19.019286, places=5)
+        self.assertAlmostEqual(budget, 18.681399, places=5)
 
     def test_the_old_fixed_timeout_could_not_cover_that_leg(self):
         # A permanent regression guard on the defect: 15.83 s of constant-speed
         # travel alone already exceeds the old hard-coded 15 s budget, so the
         # move reported failure on every single run while flying correctly.
+        old_fixed_timeout_s = 15.0
         run_phase_s = (2.5 - 0.15 / KP_POS) / 0.15
-        self.assertGreater(run_phase_s, MOVE_TIMEOUT)
-        self.assertGreater(estimate_move_timeout(2.5, 0.15), MOVE_TIMEOUT)
+        self.assertGreater(run_phase_s, old_fixed_timeout_s)
+        self.assertGreater(estimate_move_timeout(2.5, 0.15), old_fixed_timeout_s)
 
     def test_short_hops_still_get_the_floor(self):
         # A 0.25 m step must not be given a 3-second budget just because it is
         # short; the floor keeps some slack for settling.
         self.assertAlmostEqual(estimate_move_timeout(0.25, 0.35), MOVE_TIMEOUT, places=9)
+
+    def test_the_move_floor_no_longer_swallows_the_gate_deadline(self):
+        # REGRESSION GUARD -- MED bug, 2026-08-10.
+        #
+        # The bug was not in any single constant, it was in the relationship
+        # between three of them: a 0.10 m arrival tolerance inside the optical
+        # flow noise floor, a 15 s move floor, and a 75 s per-gate deadline. A
+        # 0.25 m approach step was issued with a 15 s budget it routinely spent
+        # in full, so the deadline delivered ~5 attempts against a config whose
+        # banner advertised 14.
+        step_budget_s = estimate_move_timeout(0.25, 0.35, tolerance_m=0.15)
+        observation_s = 0.5
+        attempts = 14
+
+        old_reachable = 75.0 / (observation_s + 15.0)
+        self.assertLess(old_reachable, 6.0)  # the defect, preserved as arithmetic
+
+        needed_s = attempts * (observation_s + step_budget_s)
+        self.assertLessEqual(needed_s, 90.0)  # the current approach_timeout_s
 
     def test_the_budget_grows_with_distance_and_shrinks_with_speed(self):
         self.assertGreater(
