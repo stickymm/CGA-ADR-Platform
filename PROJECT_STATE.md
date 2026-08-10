@@ -1,10 +1,13 @@
 # PROJECT STATE — Autonomous Gate-Course Navigation
 
-**Last updated:** 2026-08-10 · **Branch:** `Gabe-Claude` · **Last commit:** `94be44a`
+**Last updated:** 2026-08-10 · **Branch:** `Gabe-Claude`
+**Commits this pass:** `8348cda` → `d7c9ede` → `5ae3b74` → `94be44a` → `11c63b1` (this file)
 **Status:** Phase 1A, 1B and 2 implemented and offline-validated. **Never flown.**
 
-This file is the single handoff document. A fresh session should be able to resume from
-this alone.
+This file is the single handoff document for *state*. For a step-by-step account of what
+actually happens on a run — code, MAVLink, and vehicle behaviour together — plus the
+Raspberry Pi / Hailo / QGroundControl deployment specifics, see **`WALKTHROUGH.md`**.
+Read the Findings Log at the end of that document before flying Phase 2.
 
 ---
 
@@ -228,9 +231,11 @@ Injector cases: `.venv/bin/python -m navigation.missions.udp_injector --list`
 `normal-reversed`, `edge-on`, `multiple-gates`, `dropout`, `frozen`, `course`,
 `multi-gate-course`, `row-swap`, `close-gates`, `association-dropout`, `non-level`.
 
-> The injector binds UDP 5050 — the same port `debug/telemetry_reader.py` uses. **One
-> publisher at a time**: two injectors running at once interleave, and no case behaves
-> as documented.
+> The injector **sends** to UDP 5050; it never binds. The *mission* binds 5050, and so
+> does `debug/telemetry_reader.py` — so only one **consumer** may run at a time. Equally
+> important: only one **publisher** at a time. Two injectors (or an injector plus the real
+> vision process) interleave into the same socket and no case behaves as documented —
+> this was observed live and cost a confusing debugging session.
 
 ### Dry run — real vehicle, real telemetry, **transmits nothing** (props off, bench)
 ```bash
