@@ -184,6 +184,13 @@ class GateLegConfig:
     backoff_distance_m: float = 1.0
     max_backoffs: int = 2
 
+    # --- Phase 2 seam ---
+    # How far an observation may be from where the caller expected this gate
+    # before it is discarded. Only used when `expected_gate=` is passed; Phase 1
+    # never sets it. Sized larger than plausible flow drift over one leg and
+    # smaller than any sane gate spacing.
+    expected_gate_radius_m: float = 2.0
+
     # --- freshness ---
     max_detection_age_s: float = 0.4
     max_telemetry_age_s: float = 0.5

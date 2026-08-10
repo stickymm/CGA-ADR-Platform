@@ -187,6 +187,12 @@ class FakeNav:
     def get_vehicle_snapshot(self) -> VehicleState:
         return self._state
 
+    def state_at(self, timestamp_s: float) -> VehicleState:
+        # The real controller returns the recorded pose closest to the stamp.
+        # With no history it falls back to the current snapshot, which is what
+        # this double models.
+        return self.get_vehicle_snapshot()
+
     def telemetry_ok(self, max_age_s: float) -> bool:
         return self.telemetry_healthy
 

@@ -64,8 +64,31 @@ def approach_and_cross_one_gate(
     *,
     gate_index: int = 0,
     log: LogFn = print,
+    expected_gate: Optional[GateFix] = None,
+    exit_leg: Optional[Callable[[NavigationController, GateFix], bool]] = None,
 ) -> GateOutcome:
-    """Fly one gate.  Always returns; never raises for an in-flight condition."""
+    """Fly one gate.  Always returns; never raises for an in-flight condition.
+
+    ``expected_gate``
+        Where the caller believes this gate is, in local NED.  Phase 2 knows,
+        because it has been tracking the gate across frames; Phase 1 does not
+        and passes None, which is the default and changes nothing.
+
+        Used only to **reject** an observation that cannot be the expected gate
+        -- it never supplies a position.  A gate 4 m from where the mission
+        expected one is far more likely to be a different gate, a reflection, or
+        a doorway than it is to be evidence that the mission was wrong.  Acting
+        on it means flying at the wrong thing with full confidence; refusing it
+        costs one observation.
+
+    ``exit_leg``
+        What to do once the plane is crossed, replacing the default "hold".
+        This is the seam that lets Phase 2 fly a planned transition out of the
+        gate **without gate_leg knowing anything about Phase 2** -- and, just as
+        importantly, lets Phase 2 degrade to Phase 1B behaviour by passing None
+        rather than by branching.  Returning False marks the exit as
+        incomplete; the crossing itself still counts, because it happened.
+    """
 
     started_s = time.time()
     deadline = started_s + cfg.approach_timeout_s
@@ -75,6 +98,7 @@ def approach_and_cross_one_gate(
     attempts = 0
     align_attempts = 0
     observe_failures = 0
+    expected_mismatches = 0
     scans_used = 0
     backoffs_used = 0
     reacquires = 0
@@ -168,7 +192,11 @@ def approach_and_cross_one_gate(
         attempts += 1
 
         # ---------------- localize and report everything ----------------
-        state = nav.get_vehicle_snapshot()
+        # Deskew: the detection describes where the gate was when its FRAME was
+        # captured, not when the datagram arrived. state_at() returns the pose
+        # closest to that stamp, falling back to the current snapshot when there
+        # is no history, so this is safe for every caller.
+        state = nav.state_at(detection.timestamp)
         fix = localize_gate(
             detection,
             state,
@@ -178,6 +206,34 @@ def approach_and_cross_one_gate(
             cam_yaw_offset_deg=mission.cam_yaw_offset_deg,
             max_cone_deg=cfg.commit_max_cone_deg,
         )
+
+        if expected_gate is not None:
+            strayed = math.dist(
+                (fix.n, fix.e, fix.d),
+                (expected_gate.n, expected_gate.e, expected_gate.d),
+            )
+            if strayed > cfg.expected_gate_radius_m:
+                # Counted separately from observe_failures, which the successful
+                # -observation path above resets on every pass. Sharing that
+                # counter would mean this one never accumulates, and a mission
+                # that rejects every observation would loop until its deadline
+                # rather than reporting what happened.
+                expected_mismatches += 1
+                log(
+                    f"[!] Gate {gate_index}: observation is {strayed:.2f} m from where "
+                    f"this gate was expected (limit {cfg.expected_gate_radius_m:.2f} m). "
+                    f"More likely a different gate or a false positive than a "
+                    f"correction. Discarding and re-observing "
+                    f"({expected_mismatches}/{cfg.max_observe_retries + 1})."
+                )
+                if expected_mismatches > cfg.max_observe_retries:
+                    return finish(
+                        GateResult.LOST,
+                        f"every observation was too far from the expected gate "
+                        f"position (last {strayed:.2f} m away)",
+                    )
+                continue
+
         last_fix = fix
         _log_fix(fix, state, gate_index, attempts, envelope, log)
 
@@ -198,11 +254,30 @@ def approach_and_cross_one_gate(
                     f"\n--- GATE {gate_index}: COMMITTING. Vision is no longer "
                     f"trusted; flying the frozen pose. ---"
                 )
-                if _fly_through_gate(nav, fix, cfg, envelope, gate_index, log=log):
+                if not _fly_through_gate(nav, fix, cfg, envelope, gate_index, log=log):
+                    return finish(
+                        GateResult.TIMED_OUT, "pass-through did not clear the gate plane"
+                    )
+
+                # The gate IS crossed at this point. Whatever the exit leg does
+                # or fails to do cannot un-cross it, so the outcome stays
+                # CROSSED and a failed exit is reported in the reason instead.
+                if exit_leg is None:
                     return finish(GateResult.CROSSED, "gate crossed")
-                return finish(
-                    GateResult.TIMED_OUT, "pass-through did not clear the gate plane"
-                )
+                try:
+                    if exit_leg(nav, fix):
+                        return finish(GateResult.CROSSED, "gate crossed; exit leg flown")
+                    return finish(
+                        GateResult.CROSSED,
+                        "gate crossed; exit leg did not complete (holding instead)",
+                    )
+                except Exception as exc:
+                    log(f"[!] Exit leg raised {exc!r}; holding after the crossing")
+                    if nav.running:
+                        nav.hold_position(yaw_rad=fix.yaw_rad, label=f"after gate {gate_index}")
+                    return finish(
+                        GateResult.CROSSED, f"gate crossed; exit leg failed: {exc!r}"
+                    )
             continue
         confirmed_frames = 0
 
