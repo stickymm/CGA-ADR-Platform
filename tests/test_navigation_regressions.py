@@ -310,6 +310,60 @@ class FrozenFeedTests(unittest.TestCase):
         self.assertTrue(self.mission.feed_frozen)
 
 
+class MultiGateCaptureTests(unittest.TestCase):
+    """PHASE 2A -- the listener consumed gates[0] and discarded the other rows."""
+
+    def setUp(self):
+        self.mission = GateMission()
+
+    def _ingest(self, rows, fps=30.0):
+        self.mission._ingest_payload({"fps": fps, "gates": rows})
+
+    def test_every_valid_row_is_kept_not_just_the_nearest(self):
+        self._ingest([
+            [3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [7.1, 7.0, 1.5, 0.0, 0.0, 0.0, 25.0],
+            [12.1, 12.0, -2.0, 0.0, 0.0, 0.0, -20.0],
+        ])
+
+        detections = self.mission.get_latest_detections_snapshot()
+        self.assertEqual(len(detections), 3)
+        self.assertEqual([det.row_index for det in detections], [0, 1, 2])
+        self.assertAlmostEqual(detections[2].right, -2.0)
+
+    def test_the_sentinel_rows_are_dropped_from_the_multi_gate_view(self):
+        self._ingest([
+            [3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [999.0] * 7,
+            [999.0] * 7,
+        ])
+        self.assertEqual(len(self.mission.get_latest_detections_snapshot()), 1)
+
+    def test_the_phase_one_view_keeps_the_sentinel_so_staleness_signal_two_survives(self):
+        # observe_gate relies on the all-999 row OVERWRITING the last good pose.
+        # Filtering it out of the single-gate view would silently delete the
+        # second of the three staleness signals.
+        self._ingest([[3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+        self._ingest([[999.0] * 7] * 3)
+
+        latest = self.mission.get_latest_detection_snapshot()
+        self.assertIsNotNone(latest)
+        self.assertAlmostEqual(latest.dist, 999.0)
+        self.assertEqual(self.mission.get_latest_detections_snapshot(), [])
+
+    def test_the_publisher_frame_rate_is_carried_through(self):
+        self._ingest([[3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]], fps=28.5)
+        self.assertAlmostEqual(
+            self.mission.get_latest_detections_snapshot()[0].source_fps, 28.5
+        )
+
+    def test_a_short_or_malformed_row_does_not_kill_the_listener(self):
+        # A units change or a publisher revision must degrade, not crash the
+        # thread that carries every detection.
+        self._ingest([[3.0, 3.0, 0.0], ["x", 1, 2, 3, 4, 5, 6]])
+        self.assertEqual(self.mission.get_latest_detections_snapshot(), [])
+
+
 class SourceFilterTests(unittest.TestCase):
     """MED -- only HEARTBEAT was filtered by source system."""
 

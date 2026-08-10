@@ -90,6 +90,98 @@ class RotationTests(unittest.TestCase):
         result = rotate_body_to_ned(3.0, 0.0, 0.0, yaw_rad=0.0, pitch_rad=deg_to_rad(10.0))
         self.assertAlmostEqual(result[2], -0.52094453, places=7)
 
+    def test_roll_alone_does_not_move_a_vector_along_the_roll_axis(self):
+        # Roll is rotation about body x. A purely-forward observation is ON that
+        # axis, so it must come through untouched -- a cheap but effective check
+        # that the three rotations have not been composed in the wrong order.
+        result = rotate_body_to_ned(3.0, 0.0, 0.0, yaw_rad=0.0, roll_rad=deg_to_rad(25.0))
+        self.assertAlmostEqual(result[0], 3.0, places=9)
+        self.assertAlmostEqual(result[1], 0.0, places=9)
+        self.assertAlmostEqual(result[2], 0.0, places=9)
+
+    def test_non_zero_roll_and_pitch_together_against_hand_derived_values(self):
+        # PHASE 2A. The case neither a yaw-only nor a pitch-only test can catch:
+        # the cross terms, which only exist when roll AND pitch are both
+        # non-zero. Getting the composition order wrong (Rx@Ry@Rz instead of
+        # Rz@Ry@Rx) still passes every single-axis test and fails this one.
+        #
+        # yaw = 0, pitch = 30 deg, roll = 20 deg, body vector (2.0, 1.0, 0.5):
+        #   cp = 0.86602540  sp = 0.5
+        #   cr = 0.93969262  sr = 0.34202014
+        #
+        #   dn = cp*f + (sp*sr)*r + (sp*cr)*d
+        #      = 0.86602540*2 + 0.17101007*1 + 0.46984631*0.5
+        #      = 1.73205081 + 0.17101007 + 0.23492315  =  2.13798403
+        #   de = cr*r - sr*d
+        #      = 0.93969262*1 - 0.34202014*0.5         =  0.76868255
+        #   dd = -sp*f + (cp*sr)*r + (cp*cr)*d
+        #      = -1.0 + 0.29619813 + 0.40689884        = -0.29690303
+        result = rotate_body_to_ned(
+            2.0, 1.0, 0.5,
+            yaw_rad=0.0,
+            pitch_rad=deg_to_rad(30.0),
+            roll_rad=deg_to_rad(20.0),
+        )
+
+        self.assertAlmostEqual(result[0], 2.13798403, places=7)
+        self.assertAlmostEqual(result[1], 0.76868255, places=7)
+        self.assertAlmostEqual(result[2], -0.29690303, places=7)
+
+    def test_yaw_pitch_and_roll_together_against_hand_derived_values(self):
+        # All three non-zero, and yaw at 90 degrees so a mistake that swaps the
+        # north and east rows is unmissable. Body vector (3, 0, 0):
+        #   dn = cos(90)*cos(15)*3          = 0
+        #   de = sin(90)*cos(15)*3          = 0.96592583 * 3 = 2.89777748
+        #   dd = -sin(15)*3                 = -0.25881905 * 3 = -0.77645714
+        # Roll does not enter at all here, because the observation lies on the
+        # roll axis -- which is itself a fact worth pinning down.
+        result = rotate_body_to_ned(
+            3.0, 0.0, 0.0,
+            yaw_rad=deg_to_rad(90.0),
+            pitch_rad=deg_to_rad(15.0),
+            roll_rad=deg_to_rad(-25.0),
+        )
+
+        self.assertAlmostEqual(result[0], 0.0, places=7)
+        self.assertAlmostEqual(result[1], 2.89777748, places=7)
+        self.assertAlmostEqual(result[2], -0.77645714, places=7)
+
+    def test_the_rotation_preserves_length(self):
+        # A rotation matrix is orthonormal. If a sign or a term is wrong the
+        # result is a shear, and the range to the gate silently changes with
+        # attitude -- which would corrupt the commit decision rather than just
+        # the position.
+        for yaw, pitch, roll in (
+            (0.0, 0.0, 0.0),
+            (0.7, 0.3, -0.2),
+            (-2.5, -0.4, 1.1),
+            (3.0, 0.5, 0.5),
+        ):
+            with self.subTest(yaw=yaw, pitch=pitch, roll=roll):
+                dn, de, dd = rotate_body_to_ned(
+                    2.0, 1.0, 0.5, yaw_rad=yaw, pitch_rad=pitch, roll_rad=roll
+                )
+                self.assertAlmostEqual(
+                    math.sqrt(dn * dn + de * de + dd * dd),
+                    math.sqrt(2.0**2 + 1.0**2 + 0.5**2),
+                    places=9,
+                )
+
+    def test_the_legacy_and_phase_one_paths_now_share_one_implementation(self):
+        # PROJECT_STATE gap 5: the 3-2-1 rotation lived only in frames.py, so
+        # the legacy single_gate / multi_stage_gate missions kept a yaw-only
+        # body_to_local and quietly used a different frame convention from the
+        # Phase 1 stack. There is now one matrix, and this is the assertion that
+        # keeps it that way.
+        for yaw, pitch, roll in ((0.4, 0.2, -0.3), (-1.2, 0.1, 0.9)):
+            with self.subTest(yaw=yaw):
+                self.assertEqual(
+                    body_to_local(2.0, 1.0, -0.5, yaw, pitch, roll),
+                    rotate_body_to_ned(
+                        2.0, 1.0, -0.5, yaw_rad=yaw, pitch_rad=pitch, roll_rad=roll
+                    ),
+                )
+
 
 class CircularMeanTests(unittest.TestCase):
     def test_circular_mean_does_not_collapse_across_the_wrap(self):

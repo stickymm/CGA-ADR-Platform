@@ -2063,6 +2063,54 @@ class GateMission(Mission):
                 self._payload_signature = fingerprint
                 self._identical_frames = 1
 
+    @staticmethod
+    def _row_to_detection(row, index: int, now: float, fps: float) -> Optional[GateDetection]:
+        if len(row) < 7:
+            return None
+        return GateDetection(
+            timestamp=now,
+            dist=_safe_float(row[0]),
+            forward=_safe_float(row[1]),
+            right=_safe_float(row[2]),
+            down=_safe_float(row[3]),
+            roll=_safe_float(row[4]),
+            pitch=_safe_float(row[5]),
+            yaw_deg=_safe_float(row[6]),
+            row_index=index,
+            source_fps=fps,
+        )
+
+    def _ingest_payload(self, payload) -> None:
+        """Fold one decoded vision packet into the mission's detection state.
+
+        Separated from the socket loop so the wire format can be tested without
+        opening a port -- the parsing is where a units change or a short row
+        would do its damage, and that has to be checkable on a laptop.
+        """
+        gates = payload.get("gates", [])
+        if not gates:
+            return
+
+        self._note_payload(gates)
+
+        now = time.time()
+        fps = _safe_float(payload.get("fps", 0.0), 0.0)
+
+        parsed = [
+            self._row_to_detection(row, index, now, fps)
+            for index, row in enumerate(gates)
+        ]
+        detections = [det for det in parsed if det is not None and is_valid_detection(det)]
+
+        with self._detection_lock:
+            self._latest_detections = detections
+            # Phase 1 compatibility: `_latest_detection` is the nearest row and
+            # keeps the SENTINEL row when nothing is visible, because
+            # observe_gate relies on the sentinel overwriting the last good pose
+            # -- that is staleness signal 2, and dropping it here would quietly
+            # remove it.
+            self._latest_detection = detections[0] if detections else parsed[0]
+
     def _udp_gate_listener(self):
         """Listen for vision packets and keep every valid gate in the newest one."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2080,50 +2128,7 @@ class GateMission(Mission):
                     if not gates:
                         continue
 
-                    self._note_payload(gates)
-
-                    now = time.time()
-                    fps = _safe_float(payload.get("fps", 0.0))
-                    detections = []
-                    for index, gate in enumerate(gates):
-                        if len(gate) < 7:
-                            continue
-                        det = GateDetection(
-                            timestamp=now,
-                            dist=float(gate[0]),
-                            forward=float(gate[1]),
-                            right=float(gate[2]),
-                            down=float(gate[3]),
-                            roll=float(gate[4]),
-                            pitch=float(gate[5]),
-                            yaw_deg=float(gate[6]),
-                            row_index=index,
-                            source_fps=fps,
-                        )
-                        if is_valid_detection(det):
-                            detections.append(det)
-
-                    with self._detection_lock:
-                        self._latest_detections = detections
-                        # Phase 1 compatibility: `_latest_detection` stays the
-                        # nearest row, INCLUDING the sentinel row when nothing is
-                        # visible, because observe_gate relies on the sentinel
-                        # overwriting the last good pose.
-                        self._latest_detection = detections[0] if detections else (
-                            GateDetection(
-                                timestamp=now,
-                                dist=float(gates[0][0]),
-                                forward=float(gates[0][1]),
-                                right=float(gates[0][2]),
-                                down=float(gates[0][3]),
-                                roll=float(gates[0][4]),
-                                pitch=float(gates[0][5]),
-                                yaw_deg=float(gates[0][6]),
-                                row_index=0,
-                                source_fps=fps,
-                            )
-                            if len(gates[0]) >= 7 else None
-                        )
+                    self._ingest_payload(payload)
 
                 except socket.timeout:
                     continue

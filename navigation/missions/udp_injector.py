@@ -139,6 +139,88 @@ def _case_multiple_gates(t, distance):
     ]
 
 
+# ---------------------------------------------------------------------------
+# PHASE 2A cases -- association and full attitude
+# ---------------------------------------------------------------------------
+
+
+def _case_multi_gate_course(t, distance):
+    """Three well-separated gates with distinct headings, all closing together.
+
+    Phase 2 has to localize all three from one packet and keep their identities
+    while their nearest-first row order changes underneath it.  The headings
+    differ so a planner has something real to turn toward.
+    """
+    return [
+        gate_row(distance, yaw_deg=0.0),
+        gate_row(distance + 3.5, right=+2.0, yaw_deg=+25.0),
+        gate_row(distance + 7.0, right=-1.5, yaw_deg=-20.0),
+    ]
+
+
+def _case_row_swap(t, distance):
+    """Two gates that exchange nearest-first row order halfway through.
+
+    The exact condition that makes row index useless as an identity: the
+    publisher re-sorts every frame, so row 0 becomes a different physical gate
+    with no announcement.  Association must not notice, and the track ids must
+    not move.
+    """
+    left = gate_row(distance, right=-1.2, yaw_deg=0.0)
+    right = gate_row(distance + 0.02 * (t - 10.0), right=+1.2, yaw_deg=0.0)
+    near_first = sorted([left, right], key=lambda row: row[0])
+    return near_first
+
+
+def _case_close_gates(t, distance):
+    """Two gates 0.45 m apart -- inside the default ambiguity margin.
+
+    The tracker must REFUSE to associate rather than guess, and Phase 2 must
+    degrade to Phase 1B behaviour instead of confidently turning toward whichever
+    one it picked.  A run of this case that reports clean association is a bug,
+    not a success.
+    """
+    return [
+        gate_row(distance, right=-0.225),
+        gate_row(distance, right=+0.225),
+    ]
+
+
+def _case_association_dropout(t, distance):
+    """Three gates that vanish for 2.5 s and return slightly displaced.
+
+    Models an occlusion or a pipeline stall mid-course.  Inside the tracker's
+    grown gating radius the identities survive; the 0.35 m displacement on
+    return is deliberately sized to sit near that boundary, because the useful
+    question is what happens at the edge, not in the easy case.
+    """
+    if 8.0 <= t < 10.5:
+        return []
+    displaced = 0.35 if t >= 10.5 else 0.0
+    return [
+        gate_row(distance, right=displaced),
+        gate_row(distance + 3.5, right=+2.0 + displaced, yaw_deg=+25.0),
+        gate_row(distance + 7.0, right=-1.5 + displaced, yaw_deg=-20.0),
+    ]
+
+
+def _case_non_level(t, distance):
+    """A gate whose plane is rolled and pitched relative to the camera.
+
+    Exercises the roll/pitch fields of the detection, which Phase 1 averaged and
+    then ignored.
+
+    NOTE: this tilts the GATE, not the vehicle.  To exercise the vehicle-attitude
+    terms of the 3-2-1 rotation, run the mission with ``--offline-tilt``, which
+    makes the offline model derive roll and pitch from its own horizontal
+    acceleration.  The injector cannot do that for you: it is open loop and has
+    no idea how the vehicle is oriented.
+    """
+    roll = 18.0 * math.sin(t * 0.7)
+    pitch = 12.0 * math.cos(t * 0.5)
+    return [gate_row(distance, roll=roll, pitch=pitch)]
+
+
 def _case_dropout(t, distance):
     """Detector drops out for three seconds mid-approach, then returns."""
     if 6.0 <= t < 9.0:
@@ -182,6 +264,12 @@ CASES = {
     "multiple-gates": _case_multiple_gates,
     "dropout": _case_dropout,
     "frozen": _case_frozen,
+    # Phase 2A
+    "multi-gate-course": _case_multi_gate_course,
+    "row-swap": _case_row_swap,
+    "close-gates": _case_close_gates,
+    "association-dropout": _case_association_dropout,
+    "non-level": _case_non_level,
 }
 
 CASE_HELP = {
@@ -197,6 +285,11 @@ CASE_HELP = {
     "multiple-gates": "three gates in one packet, nearest first",
     "dropout": "detector goes silent for 3 s mid-approach",
     "frozen": "publisher alive but the pose never changes (stalled camera)",
+    "multi-gate-course": "three separated gates with distinct headings, all localized",
+    "row-swap": "two gates that exchange nearest-first row order mid-run",
+    "close-gates": "two gates 0.45 m apart -- association MUST refuse, not guess",
+    "association-dropout": "three gates vanish for 2.5 s and return displaced 0.35 m",
+    "non-level": "one gate with a rolled and pitched plane (see also --offline-tilt)",
 }
 
 

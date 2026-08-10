@@ -311,6 +311,43 @@ def localize_gate(
     )
 
 
+def localize_gates(
+    detections: Sequence[GateDetection],
+    state: VehicleState,
+    envelope: AltitudeEnvelope,
+    *,
+    cam_offset_right_m: float = 0.0,
+    cam_offset_down_m: float = 0.0,
+    cam_yaw_offset_deg: float = 0.0,
+    max_cone_deg: float = 60.0,
+) -> Tuple[GateFix, ...]:
+    """Localize **every** gate in one vision packet, not just the nearest.
+
+    Phase 1 consumed ``gates[0]`` and discarded the other two rows.  That is
+    correct for 1A, and holds for 1B only because each gate is crossed before
+    the next is sought -- "nearest gate" and "next gate" happen to coincide.
+    Phase 2 plans a transition toward the *following* gate while still
+    approaching the current one, so it needs all of them.
+
+    Every fix is computed against the same vehicle pose, so they are mutually
+    consistent even though the vehicle is moving.  Ordering follows the input,
+    which the publisher sorts nearest-first -- and which is explicitly **not** a
+    stable identity across frames.  See :mod:`.association`.
+    """
+    return tuple(
+        localize_gate(
+            det,
+            state,
+            envelope,
+            cam_offset_right_m=cam_offset_right_m,
+            cam_offset_down_m=cam_offset_down_m,
+            cam_yaw_offset_deg=cam_yaw_offset_deg,
+            max_cone_deg=max_cone_deg,
+        )
+        for det in detections
+    )
+
+
 def evaluate_commit(fix: GateFix, cfg: GateLegConfig) -> CommitVerdict:
     """Decide whether to stop trusting vision and fly the gate open-loop.
 
