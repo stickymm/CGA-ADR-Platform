@@ -26,11 +26,31 @@ NOTE
 import argparse
 import json
 import math
+import random
 import socket
 import sys
 import time
 
 NO_DETECTION_ROW = [999.0, 999.0, 999.0, 999.0, 999.0, 999.0, 999.0]
+
+# Measurement noise, metres and degrees of 1-sigma.
+#
+# NOT COSMETIC.  A real PnP pose estimate jitters in the third decimal every
+# frame; a noiseless injector does not, so once the simulated range reaches its
+# floor every payload becomes bit-identical and the mission's frozen-feed
+# detector fires -- correctly, on synthetic data that is genuinely frozen.  That
+# would make the one signal that catches a stalled camera untrustworthy offline.
+# ``--case frozen`` sets these to zero, because there the whole point is that
+# nothing changes.
+DEFAULT_POSITION_NOISE_M = 0.003
+DEFAULT_ANGLE_NOISE_DEG = 0.05
+
+_noise_position_m = DEFAULT_POSITION_NOISE_M
+_noise_angle_deg = DEFAULT_ANGLE_NOISE_DEG
+
+
+def _jitter(scale: float) -> float:
+    return random.gauss(0.0, scale) if scale > 0.0 else 0.0
 
 
 def gate_row(forward, right=0.0, down=0.0, yaw_deg=0.0, roll=0.0, pitch=0.0):
@@ -38,6 +58,13 @@ def gate_row(forward, right=0.0, down=0.0, yaw_deg=0.0, roll=0.0, pitch=0.0):
 
     ``dist`` is the 3-D norm, matching how the real publisher computes it.
     """
+    forward += _jitter(_noise_position_m)
+    right += _jitter(_noise_position_m)
+    down += _jitter(_noise_position_m)
+    yaw_deg += _jitter(_noise_angle_deg)
+    roll += _jitter(_noise_angle_deg)
+    pitch += _jitter(_noise_angle_deg)
+
     dist = math.sqrt(forward * forward + right * right + down * down)
     return [
         round(dist, 3),
@@ -47,6 +74,19 @@ def gate_row(forward, right=0.0, down=0.0, yaw_deg=0.0, roll=0.0, pitch=0.0):
         round(roll, 2),
         round(pitch, 2),
         round(yaw_deg, 2),
+    ]
+
+
+def gate_row_exact(forward, right=0.0, down=0.0, yaw_deg=0.0, roll=0.0, pitch=0.0):
+    """A detection row with no measurement noise at all.
+
+    Only the ``frozen`` case uses this: it models a stalled camera republishing
+    one captured pose, and a stalled camera does not add fresh noise.
+    """
+    dist = math.sqrt(forward * forward + right * right + down * down)
+    return [
+        round(dist, 3), round(forward, 3), round(right, 3), round(down, 3),
+        round(roll, 2), round(pitch, 2), round(yaw_deg, 2),
     ]
 
 
@@ -111,9 +151,10 @@ def _case_frozen(t, distance):
 
     Models a stalled camera or a wedged pipeline.  The distance argument is
     ignored on purpose -- the whole point is that the drone moves and the
-    reported gate does not.
+    reported gate does not.  Uses the noiseless row builder: a stalled camera
+    republishes one captured pose, it does not keep generating fresh noise.
     """
-    return [gate_row(3.0)]
+    return [gate_row_exact(3.0)]
 
 
 def _case_course(t, distance):
@@ -191,7 +232,25 @@ def main(argv=None) -> int:
         help="for --case course: how often the range resets, i.e. a new gate",
     )
     parser.add_argument("--duration-s", type=float, default=0.0, help="0 runs until Ctrl-C")
+    parser.add_argument(
+        "--noise-m",
+        type=float,
+        default=DEFAULT_POSITION_NOISE_M,
+        help="1-sigma position noise. 0 makes every payload bit-identical once "
+             "the range stops changing, which the frozen-feed detector will "
+             "correctly flag",
+    )
+    parser.add_argument("--noise-deg", type=float, default=DEFAULT_ANGLE_NOISE_DEG)
+    parser.add_argument(
+        "--seed", type=int, default=None, help="seed the noise for a repeatable run"
+    )
     args = parser.parse_args(argv)
+
+    global _noise_position_m, _noise_angle_deg
+    _noise_position_m = max(0.0, args.noise_m)
+    _noise_angle_deg = max(0.0, args.noise_deg)
+    if args.seed is not None:
+        random.seed(args.seed)
 
     if args.list:
         width = max(len(name) for name in CASES)

@@ -2049,6 +2049,9 @@ class GateMission(Mission):
                 self._identical_frames = 0
                 return
             if fingerprint == self._payload_signature:
+                # Counts frames carrying this pose, INCLUDING the first one, so
+                # the number in the log is the number of frames an operator
+                # would have seen go by unchanged.
                 self._identical_frames += 1
                 if self._identical_frames == self.frozen_feed_frames:
                     print(
@@ -2058,7 +2061,7 @@ class GateMission(Mission):
                     )
             else:
                 self._payload_signature = fingerprint
-                self._identical_frames = 0
+                self._identical_frames = 1
 
     def _udp_gate_listener(self):
         """Listen for vision packets and keep every valid gate in the newest one."""
