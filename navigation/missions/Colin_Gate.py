@@ -13,7 +13,7 @@ class mediumSquare(GateMission):
         for i in 4:
             gate : GateDetection = gates[i]
             gate.yaw_deg -= math.degrees(adjust)
-            targets[i] = self.build_standoff_target(nav, gates[i], 0.5)
+            targets[i] = self.build_standoff_target(nav, gate, 0.5)
 
         gateNum : int = 4
         gate_count = 0
@@ -21,7 +21,7 @@ class mediumSquare(GateMission):
         move_dist : int = 8 # meters
 
         while nav.running and gate_count < gateNum:
-            nav.adv_move_to_target(targets[gate_count], f"target {gate_count+1} prep", vfn = 0.0, vfe = 0.0, vfd = 0.0, theta_f= math.radians(gates[gate_count].yaw_deg)-adjust)
+            nav.move_to_target_curve(targets[gate_count], f"target {gate_count+1} prep", vfn = 0.0, vfe = 0.0, vfd = 0.0, theta_f= math.radians(gates[gate_count].yaw_deg) -adjust )
             
             falseTarg = gates[gate_count]
 
@@ -29,15 +29,8 @@ class mediumSquare(GateMission):
 
             post = self.build_pass_through_target(nav, falseTarg, move_dist)
 
-            nav.adv_move_to_target(post, f"ready for target {gate_count+2}", vfn = 1.0, vfe = 0, vfd=0, theta_f=nav.get_vehicle_snapshot().yaw_rad)
-            
-            falseTarg2 = gates[gate_count+1]
-            
-            falseTarg2.yaw_deg -= adjust
-
-            post2 = self.build
-            nav.move_to_target_curve()
-            
+            nav.adv_move_to_target(post, f"ready for turn {gate_count+1}", vfn = 1.0, vfe = 0, vfd=0, theta_f=nav.get_vehicle_snapshot().yaw_rad)
+                        
             gate_count += 1
 
         if gate_count >= gateNum:
