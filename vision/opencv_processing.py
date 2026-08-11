@@ -270,10 +270,68 @@ class OpenCVProcessing():
                             undistorted_corners = cv2.fisheye.undistortPoints(
                                 full_img_corners.reshape(-1, 1, 2), self.K, self.D, P=self.K
                             )
-
-                            success, rvec, tvec = cv2.solvePnP(
-                                self.GATE_3D_CORNERS, undistorted_corners, self.K, np.zeros(4), flags=cv2.SOLVEPNP_SQPNP
+                            
+                            pts2d = undistorted_corners.reshape(-1,2)
+                            
+                            ## validate corner geometry before calling solvePnP
+                            
+                            # Reject NaN / inf
+                            if not np.isfinite(pts2d).all():
+                                print("[WARN] Invalid gate corners:", pts2d)
+                                continue
+                            
+                            # Reject udplicate / nearly-duplicate corners
+                            min_corner_dist = min(
+                                np.linalg.norm(pts2d[i] - pts2d[j])
+                                for i in range(4)
+                                for j in range(i + 1, 4)
                             )
+                            
+                            if min_corner_dist < 3.0:
+                                print("[WARN] Gate corners collapsed:", pts2d)
+                                continue
+                            
+                                                        
+                            # Reject tiny / degenerate quadrilaterals
+                            gate_area = abs(
+                                cv2.contourArea(
+                                    pts2d.astype(np.float32)
+                                )
+                            )
+                            
+                            if gate_area < 25.0:
+                                print("[WARN] Gate area too small:", gate_area)
+                                continue
+
+                            # Exactly reproduce the coordinate-space SQPnP cares about.
+                            normalized = cv2.undistortPoints(
+                                pts2d.reshape(-1, 1, 2),
+                                self.K,
+                                None
+                            ).reshape(-1, 2)
+
+                            point_variance = (
+                                np.var(normalized[:, 0]) +
+                                np.var(normalized[:, 1])
+                            )
+
+                            if point_variance < 1e-5:
+                                print(
+                                    "[WARN] SQPnP point variance too small:",
+                                    point_variance,
+                                    pts2d
+                                )
+                                continue
+                            
+                            try: 
+                                success, rvec, tvec = cv2.solvePnP(
+                                    self.GATE_3D_CORNERS, undistorted_corners, self.K, np.zeros(4), flags=cv2.SOLVEPNP_SQPNP
+                                )
+                                
+                            except cv2.error as e:
+                                print("[WARN] solvePnP failed:", e)
+                                continue
+
 
                             if success:
                                 rvec, tvec = cv2.solvePnPRefineLM(
