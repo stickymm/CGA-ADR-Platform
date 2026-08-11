@@ -1,60 +1,60 @@
-from ..navigation import GateMission, NavigationController
-class MultiStageGateMission(GateMission):
-    """Default race mission that approaches each gate in shrinking stages."""
-    
+from Colins_Nav import GateMission, NavigationController, GateDetection
+import math
+class mediumSquare(GateMission):
     def run(self, nav: NavigationController):
-        """Fly the 3m -> 2m -> 1m -> pass-through sequence for up to 8 gates."""
+        targets = []
+        gates = []
+        adjust = math.pi/12
+
+
+        while len(gates) < 4:
+            gates = self.find_gates()
+        
+        for i in 4:
+            gate : GateDetection = gates[i]
+            gate.yaw_deg -= math.degrees(adjust)
+            targets[i] = self.build_standoff_target(nav, gates[i], 0.5)
+
         gateNum : int = 4
         gate_count = 0
+        
+        move_dist : int = 8 # meters
 
         while nav.running and gate_count < gateNum:
-            print("\n==============================")
-            print(f"[*] Looking for Gate {gate_count + 1} of {gateNum}")
-            print("==============================")
+            nav.adv_move_to_target(targets[gate_count], f"target {gate_count+1} prep", vfn = 0.0, vfe = 0.0, vfd = 0.0, theta_f= math.radians(gates[gate_count].yaw_deg)-adjust)
+            
+            falseTarg = gates[gate_count]
 
-            gate = self.observe_gate(nav, duration=3.0)
-            if not gate:
-                nav.turn_around_180()
-                continue
+            falseTarg.yaw_deg -= adjust
 
-            target_3m = self.build_standoff_target(nav, gate, standoff_m=3.0)
-            nav.move_to_target(target_3m, "3m Standoff", max_speed_m_s= 0.15)
+            post = self.build_pass_through_target(nav, falseTarg, move_dist)
 
-            gate = self.observe_gate(nav, duration=6.0)
-            if not gate:
-                print("[!] Lost gate at 3m. Restarting.")
-                continue
+            nav.adv_move_to_target(post, f"ready for target {gate_count+2}", vfn = 1.0, vfe = 0, vfd=0, theta_f=nav.get_vehicle_snapshot().yaw_rad)
+            
+            falseTarg2 = gates[gate_count+1]
+            
+            falseTarg2.yaw_deg -= adjust
 
-            target_2m = self.build_standoff_target(nav, gate, standoff_m=2.0)
-            nav.move_to_target(target_2m, "2m Standoff", max_speed_m_s= 0.15)
-
-            gate = self.observe_gate(nav, duration=6.0)
-            if not gate:
-                print("[!] Lost gate at 2m. Restarting.")
-                continue
-
-            target_1m = self.build_standoff_target(nav, gate, standoff_m=1.0)
-            nav.move_to_target(target_1m, "1m Standoff", max_speed_m_s= 0.15)
-
-            gate = self.observe_gate(nav, duration=6.0)
-            if not gate:
-                print("[!] Lost gate right before pass. Restarting.")
-                continue
-
-            pass_target = self.build_pass_through_target(nav, gate, pass_dist_m=1.5)
-            nav.move_to_target(pass_target, "Through The Gate!", max_speed_m_s= 0.15)
-
+            post2 = self.build
+            nav.move_to_target_curve()
+            
             gate_count += 1
-            print(f"[*] Successfully navigated Gate {gate_count}!")
 
         if gate_count >= gateNum:
-            """
-            have drone move out of the target before landing
-            maybe check a height graph to ensure gate is passed and drone can land
-            or maybe have drone fly small circular path so the downward sensor
-            can see its full landing area but that is probably not necessary since
-            the camera should be able to determine the size of the bottom area and 
-            whether it is wide enough or to do image processing to determine if there
-            is something in the middle of the screen
-            """
+            nav.land()
+
+class advSquare(GateMission):
+    def run(self, nav: NavigationController):
+        targets = []
+        gates = []
+
+        while len(gates) < 4:
+            gates = self.find_gates()
+        
+        for i in 4:
+            targets[i] = self.build_standoff_target(nav, gates[i], 0)
+        
+        run : bool = nav.adv_run_square(targets[0], targets[1], targets[2], targets[3], 4.0)
+            
+        if run:
             nav.land()

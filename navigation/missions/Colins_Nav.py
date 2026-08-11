@@ -379,270 +379,6 @@ class NavigationController:
             print("[*] Land command sent successfully.")
         except Exception as exc:
             print(f"[!] Failed to send land command: {exc}")
-
-class Mission:
-    """Minimal mission interface used by NavigationController.run_mission()."""
-    def start(self):
-        pass
-
-    def run(self, nav: NavigationController):
-        raise NotImplementedError
-
-    def stop(self):
-        pass
-
-
-class GateMission(Mission):
-    """Base class for missions that consume gate detections over UDP."""
-    def __init__(
-        self,
-        udp_ip: str = UDP_IP,
-        udp_port: int = UDP_PORT,
-        *,
-        cam_offset_right_m: float = CAM_OFFSET_RIGHT_M,
-        cam_offset_down_m: float = CAM_OFFSET_DOWN_M,
-        cam_yaw_offset_deg: float = CAM_YAW_OFFSET_DEG,
-    ):
-        self.udp_ip = udp_ip
-        self.udp_port = udp_port
-        self.cam_offset_right_m = cam_offset_right_m
-        self.cam_offset_down_m = cam_offset_down_m
-        self.cam_yaw_offset_deg = cam_yaw_offset_deg
-
-        self._running = threading.Event()
-        self._latest_detection: Optional[GateDetection] = None
-        self._detection_lock = threading.Lock()
-        self._udp_thread: Optional[threading.Thread] = None
-
-    @property
-    def running(self) -> bool:
-        return self._running.is_set()
-
-    def start(self):
-        """Start the background UDP listener that receives gate detections."""
-        if self.running:
-            return
-
-        with self._detection_lock:
-            self._latest_detection = None
-
-        self._running.set()
-        self._udp_thread = threading.Thread(
-            target=self._udp_gate_listener,
-            daemon=True,
-            name="gate-mission-udp-listener",
-        )
-        self._udp_thread.start()
-
-    def stop(self):
-        """Stop the UDP listener loop."""
-        self._running.clear()
-
-        if self._udp_thread is not None and self._udp_thread.is_alive():
-            self._udp_thread.join(timeout=1.0)
-
-    def get_latest_detection_snapshot(self) -> Optional[GateDetection]:
-        with self._detection_lock:
-            if self._latest_detection is None:
-                return None
-            # Like vehicle snapshots, callers get a copy instead of the shared object.
-            return replace(self._latest_detection)
-
-    def _udp_gate_listener(self):
-        """Listen for the latest vision packet and keep only the newest gate."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((self.udp_ip, self.udp_port))
-        sock.settimeout(0.2)
-
-        print(f"[*] Listening for gate telemetry on UDP {self.udp_ip}:{self.udp_port}")
-
-        try:
-            while self.running:
-                try:
-                    data, _ = sock.recvfrom(4096)
-                    payload = json.loads(data.decode("utf-8"))
-                    gates = payload.get("gates", [])
-                    if not gates:
-                        continue
-
-                    gate = gates[0]
-                    det = GateDetection(
-                        timestamp=time.time(),
-                        dist=float(gate[0]),
-                        forward=float(gate[1]),
-                        right=float(gate[2]),
-                        down=float(gate[3]),
-                        roll=float(gate[4]),
-                        pitch=float(gate[5]),
-                        yaw_deg=float(gate[6]),
-                    )
-
-                    with self._detection_lock:
-                        self._latest_detection = det
-
-                except socket.timeout:
-                    continue
-                except OSError:
-                    if self.running:
-                        print("[!] UDP gate listener socket error.")
-                    return
-                except Exception as exc:
-                    print(f"[!] UDP gate listener error: {exc}")
-        finally:
-            sock.close()
-
-    def observe_gate(self, nav: NavigationController, duration: float = 1.0) -> Optional[GateDetection]:
-        """Hover in place, sample detections for a short window, then average them."""
-        print(f"[*] Observing gate for {duration}s...")
-
-        samples = []
-        t0 = time.time()
-        hold_yaw = nav.get_vehicle_snapshot().yaw_rad
-
-        while nav.running and time.time() - t0 < duration:
-            nav.send_velocity_and_yaw_target(0.0, 0.0, 0.0, hold_yaw)
-
-            det = self.get_latest_detection_snapshot()
-            if is_valid_detection(det):
-                samples.append(det)
-
-            time.sleep(0.04)
-
-        if not samples:
-            print("[!] No valid gate detections seen.")
-            return None
-
-        avg = GateDetection(
-            timestamp=time.time(),
-            dist=sum(d.dist for d in samples) / len(samples),
-            forward=sum(d.forward for d in samples) / len(samples),
-            right=sum(d.right for d in samples) / len(samples),
-            down=sum(d.down for d in samples) / len(samples),
-            roll=sum(d.roll for d in samples) / len(samples),
-            pitch=sum(d.pitch for d in samples) / len(samples),
-            yaw_deg=sum(d.yaw_deg for d in samples) / len(samples),
-        )
-
-        print(f"[*] Lock Acquired: Dist={avg.dist:.2f}m, Yaw={avg.yaw_deg:.1f}deg")
-        return avg
-
-    def detection_to_gate_local(self, det: GateDetection, state: VehicleState):
-        """Convert a camera-relative gate detection into local NED gate pose."""
-        corrected_right = det.right + self.cam_offset_right_m
-        corrected_down = det.down + self.cam_offset_down_m
-
-        dn, de, dd = body_to_local(det.forward, corrected_right, corrected_down, state.yaw_rad)
-        gate_n = state.n + dn
-        gate_e = state.e + de
-        gate_d = state.d + dd
-
-        corrected_yaw_deg = det.yaw_deg + self.cam_yaw_offset_deg
-        gate_yaw = wrap_pi(state.yaw_rad + deg_to_rad(corrected_yaw_deg))
-
-        return gate_n, gate_e, gate_d, gate_yaw
-
-    def build_standoff_target(
-        self,
-        nav: NavigationController,
-        det: GateDetection,
-        standoff_m: float,
-    ) -> LocalTarget:
-        """Build a target that stops in front of the gate by the given standoff."""
-        state = nav.get_vehicle_snapshot()
-        gate_n, gate_e, gate_d, gate_yaw = self.detection_to_gate_local(det, state)
-        f_n, f_e = local_forward_vector(gate_yaw)
-
-        return LocalTarget(
-            n=gate_n - standoff_m * f_n,
-            e=gate_e - standoff_m * f_e,
-            d=gate_d,
-            yaw_rad=gate_yaw,
-        )
-
-
-    def build_pass_through_target(
-        self,
-        nav: NavigationController,
-        det: GateDetection,
-        pass_dist_m: float,
-    ) -> LocalTarget:
-        """Build a target that carries the drone through and past the gate."""
-        state = nav.get_vehicle_snapshot()
-        gate_n, gate_e, gate_d, gate_yaw = self.detection_to_gate_local(det, state)
-        f_n, f_e = local_forward_vector(gate_yaw)
-
-        return LocalTarget(
-            n=gate_n + pass_dist_m * f_n,
-            e=gate_e + pass_dist_m * f_e,
-            d=gate_d,
-            yaw_rad=gate_yaw,
-        )
-
-    def run(self, nav: NavigationController):
-        raise NotImplementedError
-    
-    def find_gates(self, nav: NavigationController, duration: float = 1.0) -> Optional[GateDetection]:
-        #hovers and finds all possible gates
-        print(f"[*] Observing gates for {duration}s...")
-
-        minDist_m = 3    
-        #This records the maximum distance allowed between gate detections before they are considered new gates
-        
-        samples = []
-        t0 = time.time()
-        hold_yaw = nav.get_vehicle_snapshot().yaw_rad
-
-        while nav.running and time.time() - t0 < duration:
-            nav.send_velocity_and_yaw_target(0.0, 0.0, 0.0, hold_yaw)
-
-            det = self.get_latest_detection_snapshot()
-            if is_valid_detection(det):
-                samples.append(det)
-
-            time.sleep(0.04)
-
-        if not samples:
-            print("[!] No valid gate detections seen.")
-            return None
-
-        avgs = []
-        while(len(samples) > 0): 
-            #turns samples list into multiple averages
-            
-            sample = []
-            gateOne : GateDetection = samples[0]
-            for i in len(samples):
-                gateCurr : GateDetection = samples[i]
-                if(math.abs(gateCurr.dist - gateOne.dist) < minDist_m & 
-                   math.abs(gateCurr.forward - gateOne.forward) < minDist_m & 
-                   math.abs(gateCurr.right - gateOne.right) < minDist_m & 
-                   math.abs(gateCurr.down - gateOne.down) < minDist_m):
-                    
-                    """checks to see if the gate detections are close enough
-                    together to count as one gate"""
-
-                    sample.append(gateCurr)
-
-            for i in len(sample):
-                samples.remove(sample[i])
-            
-            #avg combines the sample items to create each gate
-            avg = GateDetection(
-            timestamp=time.time(),
-            dist=sum(d.dist for d in sample) / len(sample),
-            forward=sum(d.forward for d in sample) / len(sample),
-            right=sum(d.right for d in sample) / len(sample),
-            down=sum(d.down for d in sample) / len(sample),
-            roll=sum(d.roll for d in sample) / len(sample),
-            pitch=sum(d.pitch for d in sample) / len(sample),
-            yaw_deg=sum(d.yaw_deg for d in sample) / len(sample),)
-
-            avgs.append(avg)
-            sample.clear
-        print(f"found {len(avgs)} gates")
-        return avgs
-    
-    
     def move_to_target_curve(
         self,
         final_target: LocalTarget,
@@ -897,3 +633,533 @@ class GateMission(Mission):
     def runPath():
         #should know all the calculations and do them first before then giving each function its start and end values
         print("hi")
+
+    
+    def adv_run_square(
+        self,
+        targ_1: LocalTarget,
+        targ_2: LocalTarget,
+        targ_3: LocalTarget,
+        targ_4: LocalTarget,
+        ideal_Vel: float,
+        max_speed_m_s: float = MAX_FLIGHT_SPEED_M_S,
+        timeout_s: float = MOVE_TIMEOUT,
+    ):
+        state = self.get_vehicle_snapshot()
+        period = 1.0 / POSITION_RATE_HZ
+
+        tolerance = 0.5
+        ang_tol = 0.1
+
+
+        adjust : float = math.pi / 12 
+        #radians to rotate the drone counterclockwise relative to the target
+        change_dist = 5
+        #when the drone should change operations
+        
+        #set up
+
+        targ_1n = targ_1.n
+        targ_1e = targ_1.e
+        targ_1d = targ_1.d
+        targ_1y = targ_1.yaw_rad
+
+        targ_2n = targ_2.n
+        targ_2e = targ_2.e
+        targ_2d = targ_2.d
+        targ_2y = targ_2.yaw_rad
+
+        targ_3n = targ_3.n
+        targ_3e = targ_3.e
+        targ_3d = targ_3.d
+        targ_3y = targ_3.yaw_rad
+
+        targ_4n = targ_4.n
+        targ_4e = targ_4.e
+        targ_4d = targ_4.d
+        targ_4y = targ_4.yaw_rad
+
+        orig_n = state.n
+        orig_e = state.e
+        orig_d = state.d
+        orig_yaw = state.yaw_rad
+
+        max_turn_rate : float = math.pi/3 #rad/sec
+
+        #step one (leveling with target 1)
+
+        start_time = time.time()
+
+        while not math.abs(state.d - targ_1d) < tolerance :
+            state = self.get_velocity_snapshot()
+
+            
+            err_d = targ_1d - state.d
+
+            vd = err_d * KP_POS
+
+            self.send_velocity_and_yaw_target(0.0, 0.0, vd, targ_1y)
+            time.sleep(period)
+
+        #step two (prepping to run through target 2)
+
+        
+
+        #theoretically the angle for each turn is 90 so we can factor that into the sweep calculations
+
+    
+        ideal_time = max_turn_rate * 4 / math.pi
+        ideal_arc_len = ideal_time * ideal_Vel
+        ideal_radius = 2 * ideal_arc_len / math.pi
+
+        post1_n = targ_2n - ideal_radius
+        post1_e = targ_2e - ideal_radius
+        post1_d = targ_2d
+
+        err_n1 = post1_n - state.n
+        err_e1 = post1_e - state.e
+            
+        err_n2 = targ_1n - state.n
+        err_e2 = targ_1e - state.e
+        
+        # moves the drone to be lined up correctly
+
+        factor: float = 0.5 # adjust this as necessary
+
+        
+
+        while not math.abs(err_n1/err_e1 - err_n2/err_e2) < tolerance:
+            state = self.get_vehicle_position()
+            
+            err_n1 = post1_n - state.n
+            err_e1 = post1_e - state.e
+            
+            err_n2 = targ_1n - state.n
+            err_e2 = targ_1e - state.e
+
+
+            off = err_n1/err_e1 - err_n2/err_e2
+
+            sign = (math.abs(err_n1/err_e1) / (err_n1/err_e1)) * (math.abs(err_n2/err_e2) / (err_n2/err_e2))
+
+            ve = factor * off * sign
+
+            self.send_velocity_and_yaw_target(0.0, ve, 0.0, state.yaw_rad)
+
+            time.sleep(period)
+        
+        self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, state.yaw_rad)
+
+
+        # need to find best location relative to target. will need tweaking
+        state = self.get_vehicle_position()
+
+
+        err_n1 = post1_n - state.n
+        err_e1 = post1_e - state.e
+            
+
+        angle = math.atan(err_n1/err_e1)
+
+        while not math.abs(state.n - post1_n) < tolerance and not math.abs(state.e - post1_e) < tolerance:
+            state = self.get_vehicle_position()
+
+            #self.send_velocity_and_yaw_target(ideal_Vel * math.sin(angle), ideal_Vel * math.cos(angle), 0.0, angle)
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, angle)
+            time.sleep(period)
+
+
+
+        #step 3 first turn
+
+        theta_rate = max_turn_rate / period
+
+        while not math.abs(state.yaw_rad - (targ_2y - angle)) < ang_tol:
+            state = self.get_vehicle_position()
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
+            time.sleep(period)
+        
+
+        #step 4 going to post 2
+
+        post2_n = targ_3n + ideal_radius
+        post2_e = targ_3e - ideal_radius
+        post2_d = targ_3d
+
+        while not math.abs(state.n - post2_n) < tolerance and not math.abs(state.e - post2_e) < tolerance:
+            state = self.get_vehicle_position()
+
+            #may need to build a mechanism to determine the correct angle
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad)
+            time.sleep(period)
+        
+        #step 5 turning through target 3
+
+        while not math.abs(state.yaw_rad - (targ_3y - angle)) < ang_tol:
+            state = self.get_vehicle_position()
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
+            time.sleep(period)
+        
+        #step 6
+
+        post3_n = targ_4n + ideal_radius
+        post3_e = targ_4e + ideal_radius
+        post3_d = targ_4d
+
+        while not math.abs(state.n - post3_n) < tolerance and not math.abs(state.e - post3_e) < tolerance:
+            state = self.get_vehicle_position()
+
+            #may need to build a mechanism to determine the correct angle
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad)
+            time.sleep(period)
+
+        #step 7
+
+        while not math.abs(state.yaw_rad - (targ_4y - angle)) < ang_tol:
+            state = self.get_vehicle_position()
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
+            time.sleep(period)
+
+        #step 8
+
+        end_point_n = targ_4n - 2
+        end_point_e = targ_4e - 2
+
+        while not math.abs(state.n - end_point_n) < tolerance and not math.abs(state.e - end_point_e) < tolerance:
+            state = self.get_vehicle_position()
+
+            err_n = end_point_n - state.n
+            err_e = end_point_e - state.e
+
+            vn = KP_POS * err_n
+            ve = KP_POS * err_e
+
+            self.send_velocity_and_yaw_target(vn, ve, 0.0, state.yaw_rad)
+            time.sleep(period)
+
+        return True
+
+    def turn_test(self, 
+                  targ_2: LocalTarget, 
+                  ideal_Vel : float,
+                  ):
+        period = 1.0 / POSITION_RATE_HZ
+        max_turn_rate : float = math.pi/3 #rad/sec
+        ang_tol = 0.1
+        tolerance = 0.5
+
+        targ_2n = targ_2.n
+        targ_2e = targ_2.e
+        targ_2d = targ_2.d
+        targ_2y = targ_2.yaw_rad
+
+        ideal_time = max_turn_rate * 4 / math.pi
+        ideal_arc_len = ideal_time * ideal_Vel
+        ideal_radius = 2 * ideal_arc_len / math.pi
+
+        post1_n = targ_2n - ideal_radius
+        post1_e = targ_2e - ideal_radius
+        post1_d = targ_2d
+
+        state = self.get_vehicle_position()
+        
+        #lines up for the turn test
+        while not math.abs(state.n - post1_n) < tolerance and not math.abs(state.e - post1_e) < tolerance:
+            state = self.get_vehicle_position()
+
+            err_n = post1_n - state.n
+            err_e = post1_e - state.e
+
+            vn = KP_POS * err_n
+            ve = KP_POS * err_e
+
+
+        self.send_velocity_and_yaw_target(0.0, 0.0, 0.0, state.yaw_rad)
+        theta_rate = max_turn_rate / period
+
+        final_ang = state.yaw_rad - math.pi/4
+
+        #runs the turn test
+        while not math.abs(state.yaw_rad - targ_2.yaw_rad) < ang_tol:
+            state = self.get_vehicle_position()
+
+            self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
+            time.sleep(period)
+
+    def adv_turn():
+        #maybe make a function that scales the east and north velocities as the path is travelled
+        print("hi")
+
+class Mission:
+    """Minimal mission interface used by NavigationController.run_mission()."""
+    def start(self):
+        pass
+
+    def run(self, nav: NavigationController):
+        raise NotImplementedError
+
+    def stop(self):
+        pass
+
+
+class GateMission(Mission):
+    """Base class for missions that consume gate detections over UDP."""
+    def __init__(
+        self,
+        udp_ip: str = UDP_IP,
+        udp_port: int = UDP_PORT,
+        *,
+        cam_offset_right_m: float = CAM_OFFSET_RIGHT_M,
+        cam_offset_down_m: float = CAM_OFFSET_DOWN_M,
+        cam_yaw_offset_deg: float = CAM_YAW_OFFSET_DEG,
+    ):
+        self.udp_ip = udp_ip
+        self.udp_port = udp_port
+        self.cam_offset_right_m = cam_offset_right_m
+        self.cam_offset_down_m = cam_offset_down_m
+        self.cam_yaw_offset_deg = cam_yaw_offset_deg
+
+        self._running = threading.Event()
+        self._latest_detection: Optional[GateDetection] = None
+        self._detection_lock = threading.Lock()
+        self._udp_thread: Optional[threading.Thread] = None
+
+    @property
+    def running(self) -> bool:
+        return self._running.is_set()
+
+    def start(self):
+        """Start the background UDP listener that receives gate detections."""
+        if self.running:
+            return
+
+        with self._detection_lock:
+            self._latest_detection = None
+
+        self._running.set()
+        self._udp_thread = threading.Thread(
+            target=self._udp_gate_listener,
+            daemon=True,
+            name="gate-mission-udp-listener",
+        )
+        self._udp_thread.start()
+
+    def stop(self):
+        """Stop the UDP listener loop."""
+        self._running.clear()
+
+        if self._udp_thread is not None and self._udp_thread.is_alive():
+            self._udp_thread.join(timeout=1.0)
+
+    def get_latest_detection_snapshot(self) -> Optional[GateDetection]:
+        with self._detection_lock:
+            if self._latest_detection is None:
+                return None
+            # Like vehicle snapshots, callers get a copy instead of the shared object.
+            return replace(self._latest_detection)
+
+    def _udp_gate_listener(self):
+        """Listen for the latest vision packet and keep only the newest gate."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((self.udp_ip, self.udp_port))
+        sock.settimeout(0.2)
+
+        print(f"[*] Listening for gate telemetry on UDP {self.udp_ip}:{self.udp_port}")
+
+        try:
+            while self.running:
+                try:
+                    data, _ = sock.recvfrom(4096)
+                    payload = json.loads(data.decode("utf-8"))
+                    gates = payload.get("gates", [])
+                    if not gates:
+                        continue
+
+                    gate = gates[0]
+                    det = GateDetection(
+                        timestamp=time.time(),
+                        dist=float(gate[0]),
+                        forward=float(gate[1]),
+                        right=float(gate[2]),
+                        down=float(gate[3]),
+                        roll=float(gate[4]),
+                        pitch=float(gate[5]),
+                        yaw_deg=float(gate[6]),
+                    )
+
+                    with self._detection_lock:
+                        self._latest_detection = det
+
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.running:
+                        print("[!] UDP gate listener socket error.")
+                    return
+                except Exception as exc:
+                    print(f"[!] UDP gate listener error: {exc}")
+        finally:
+            sock.close()
+
+    def observe_gate(self, nav: NavigationController, duration: float = 1.0) -> Optional[GateDetection]:
+        """Hover in place, sample detections for a short window, then average them."""
+        print(f"[*] Observing gate for {duration}s...")
+
+        samples = []
+        t0 = time.time()
+        hold_yaw = nav.get_vehicle_snapshot().yaw_rad
+
+        while nav.running and time.time() - t0 < duration:
+            nav.send_velocity_and_yaw_target(0.0, 0.0, 0.0, hold_yaw)
+
+            det = self.get_latest_detection_snapshot()
+            if is_valid_detection(det):
+                samples.append(det)
+
+            time.sleep(0.04)
+
+        if not samples:
+            print("[!] No valid gate detections seen.")
+            return None
+
+        avg = GateDetection(
+            timestamp=time.time(),
+            dist=sum(d.dist for d in samples) / len(samples),
+            forward=sum(d.forward for d in samples) / len(samples),
+            right=sum(d.right for d in samples) / len(samples),
+            down=sum(d.down for d in samples) / len(samples),
+            roll=sum(d.roll for d in samples) / len(samples),
+            pitch=sum(d.pitch for d in samples) / len(samples),
+            yaw_deg=sum(d.yaw_deg for d in samples) / len(samples),
+        )
+
+        print(f"[*] Lock Acquired: Dist={avg.dist:.2f}m, Yaw={avg.yaw_deg:.1f}deg")
+        return avg
+
+    def detection_to_gate_local(self, det: GateDetection, state: VehicleState):
+        """Convert a camera-relative gate detection into local NED gate pose."""
+        corrected_right = det.right + self.cam_offset_right_m
+        corrected_down = det.down + self.cam_offset_down_m
+
+        dn, de, dd = body_to_local(det.forward, corrected_right, corrected_down, state.yaw_rad)
+        gate_n = state.n + dn
+        gate_e = state.e + de
+        gate_d = state.d + dd
+
+        corrected_yaw_deg = det.yaw_deg + self.cam_yaw_offset_deg
+        gate_yaw = wrap_pi(state.yaw_rad + deg_to_rad(corrected_yaw_deg))
+
+        return gate_n, gate_e, gate_d, gate_yaw
+
+    def build_standoff_target(
+        self,
+        nav: NavigationController,
+        det: GateDetection,
+        standoff_m: float,
+    ) -> LocalTarget:
+        """Build a target that stops in front of the gate by the given standoff."""
+        state = nav.get_vehicle_snapshot()
+        gate_n, gate_e, gate_d, gate_yaw = self.detection_to_gate_local(det, state)
+        f_n, f_e = local_forward_vector(gate_yaw)
+
+        return LocalTarget(
+            n=gate_n - standoff_m * f_n,
+            e=gate_e - standoff_m * f_e,
+            d=gate_d,
+            yaw_rad=gate_yaw,
+        )
+
+
+    def build_pass_through_target(
+        self,
+        nav: NavigationController,
+        det: GateDetection,
+        pass_dist_m: float,
+    ) -> LocalTarget:
+        """Build a target that carries the drone through and past the gate."""
+        state = nav.get_vehicle_snapshot()
+        gate_n, gate_e, gate_d, gate_yaw = self.detection_to_gate_local(det, state)
+        f_n, f_e = local_forward_vector(gate_yaw)
+
+        return LocalTarget(
+            n=gate_n + pass_dist_m * f_n,
+            e=gate_e + pass_dist_m * f_e,
+            d=gate_d,
+            yaw_rad=gate_yaw,
+        )
+
+    def run(self, nav: NavigationController):
+        raise NotImplementedError
+    
+    def find_gates(self, nav: NavigationController, duration: float = 1.0) -> Optional[GateDetection]:
+        #hovers and finds all possible gates
+        
+        print(f"[*] Observing gates for {duration}s...")
+
+        minDist_m = 1    
+        #This records the maximum distance allowed between gate detections before they are considered new gates
+        
+        samples = []
+        t0 = time.time()
+        hold_yaw = nav.get_vehicle_snapshot().yaw_rad
+
+        while nav.get_vehicle_snapshot().d < 4:
+            vd = 4 - nav.get_vehicle_snapshot().d * KP_POS
+            nav.send_velocity_and_yaw_target(0.0, 0.0, vd, hold_yaw)
+
+
+        while nav.running and time.time() - t0 < duration:
+            nav.send_velocity_and_yaw_target(0.0, 0.0, 0.0, hold_yaw)
+
+            det = self.get_latest_detection_snapshot()
+            if is_valid_detection(det):
+                samples.append(det)
+
+            time.sleep(0.04)
+
+        if not samples:
+            print("[!] No valid gate detections seen.")
+            return None
+
+        avgs = []
+        while(len(samples) > 0): 
+            #turns samples list into multiple averages
+            
+            sample = []
+            gateOne : GateDetection = samples[0]
+            for i in len(samples):
+                gateCurr : GateDetection = samples[i]
+                if(math.abs(gateCurr.dist - gateOne.dist) < minDist_m & 
+                   math.abs(gateCurr.forward - gateOne.forward) < minDist_m & 
+                   math.abs(gateCurr.right - gateOne.right) < minDist_m & 
+                   math.abs(gateCurr.down - gateOne.down) < minDist_m):
+                    
+                    """checks to see if the gate detections are close enough
+                    together to count as one gate"""
+
+                    sample.append(gateCurr)
+
+            for i in len(sample):
+                samples.remove(sample[i])
+            
+            #avg combines the sample items to create each gate
+            avg = GateDetection(
+            timestamp=time.time(),
+            dist=sum(d.dist for d in sample) / len(sample),
+            forward=sum(d.forward for d in sample) / len(sample),
+            right=sum(d.right for d in sample) / len(sample),
+            down=sum(d.down for d in sample) / len(sample),
+            roll=sum(d.roll for d in sample) / len(sample),
+            pitch=sum(d.pitch for d in sample) / len(sample),
+            yaw_deg=sum(d.yaw_deg for d in sample) / len(sample),)
+
+            avgs.append(avg)
+            sample.clear
+        print(f"found {len(avgs)} gates")
+        return avgs
+    
