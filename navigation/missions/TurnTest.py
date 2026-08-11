@@ -1,5 +1,5 @@
 from Colins_Nav import GateMission, NavigationController, GateDetection
-class testMission(GateMission):
+class TurnTest(GateMission):
     def run(self, nav: NavigationController):
         gateNum : int = 1
         gate_count = 0
@@ -9,7 +9,7 @@ class testMission(GateMission):
 
         target1 = self.build_standoff_target(nav, gate1, 1.0)
         nav.move_to_target(target1, "running")
-        
+
         while nav.running and gate_count < gateNum:
             print("beginning the search")
             gate = self.observe_gate(nav, duration = 3.0)
