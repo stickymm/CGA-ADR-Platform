@@ -626,7 +626,7 @@ class NavigationController:
 
         return False
     
-    def genPath(self, nav : NavigationController, ):
+    def genPath():
         #generates path for drone
         print("hi")
 
