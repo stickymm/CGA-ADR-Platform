@@ -1,6 +1,6 @@
 from Colins_Nav import GateMission, NavigationController, GateDetection
 import math
-class mediumSquare(GateMission):
+class Colin_Gate(GateMission):
     def run(self, nav: NavigationController):
         targets = []
         gates = []
@@ -36,7 +36,7 @@ class mediumSquare(GateMission):
         if gate_count >= gateNum:
             nav.land()
 
-class advSquare(GateMission):
+"""class advSquare(GateMission):
     def run(self, nav: NavigationController):
         targets = []
         gates = []
@@ -50,4 +50,4 @@ class advSquare(GateMission):
         run : bool = nav.adv_run_square(targets[0], targets[1], targets[2], targets[3], 4.0)
             
         if run:
-            nav.land()
+            nav.land()"""
