@@ -691,7 +691,7 @@ class NavigationController:
         start_time = time.time()
 
         while not math.abs(state.d - targ_1d) < tolerance :
-            state = self.get_velocity_snapshot()
+            state = self.get_vehicle_snapshot()
 
             
             err_d = targ_1d - state.d
@@ -729,7 +729,7 @@ class NavigationController:
         
 
         while not math.abs(err_n1/err_e1 - err_n2/err_e2) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
             
             err_n1 = post1_n - state.n
             err_e1 = post1_e - state.e
@@ -752,7 +752,7 @@ class NavigationController:
 
 
         # need to find best location relative to target. will need tweaking
-        state = self.get_vehicle_position()
+        state = self.get_vehicle_snapshot()
 
 
         err_n1 = post1_n - state.n
@@ -762,7 +762,7 @@ class NavigationController:
         angle = math.atan(err_n1/err_e1)
 
         while not math.abs(state.n - post1_n) < tolerance and not math.abs(state.e - post1_e) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             #self.send_velocity_and_yaw_target(ideal_Vel * math.sin(angle), ideal_Vel * math.cos(angle), 0.0, angle)
             self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, angle)
@@ -775,7 +775,7 @@ class NavigationController:
         theta_rate = max_turn_rate / period
 
         while not math.abs(state.yaw_rad - (targ_2y - angle)) < ang_tol:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
             time.sleep(period)
@@ -788,7 +788,7 @@ class NavigationController:
         post2_d = targ_3d
 
         while not math.abs(state.n - post2_n) < tolerance and not math.abs(state.e - post2_e) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             #may need to build a mechanism to determine the correct angle
 
@@ -798,7 +798,7 @@ class NavigationController:
         #step 5 turning through target 3
 
         while not math.abs(state.yaw_rad - (targ_3y - angle)) < ang_tol:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
             time.sleep(period)
@@ -810,7 +810,7 @@ class NavigationController:
         post3_d = targ_4d
 
         while not math.abs(state.n - post3_n) < tolerance and not math.abs(state.e - post3_e) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             #may need to build a mechanism to determine the correct angle
 
@@ -820,7 +820,7 @@ class NavigationController:
         #step 7
 
         while not math.abs(state.yaw_rad - (targ_4y - angle)) < ang_tol:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
             time.sleep(period)
@@ -831,7 +831,7 @@ class NavigationController:
         end_point_e = targ_4e - 2
 
         while not math.abs(state.n - end_point_n) < tolerance and not math.abs(state.e - end_point_e) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             err_n = end_point_n - state.n
             err_e = end_point_e - state.e
@@ -866,11 +866,11 @@ class NavigationController:
         post1_e = targ_2e - ideal_radius
         post1_d = targ_2d
 
-        state = self.get_vehicle_position()
+        state = self.get_vehicle_snapshot()
         
         #lines up for the turn test
         while not math.abs(state.n - post1_n) < tolerance and not math.abs(state.e - post1_e) < tolerance:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             err_n = post1_n - state.n
             err_e = post1_e - state.e
@@ -886,7 +886,7 @@ class NavigationController:
 
         #runs the turn test
         while not math.abs(state.yaw_rad - targ_2.yaw_rad) < ang_tol:
-            state = self.get_vehicle_position()
+            state = self.get_vehicle_snapshot()
 
             self.send_velocity_and_yaw_target(ideal_Vel, 0.0, 0.0, state.yaw_rad + theta_rate)
             time.sleep(period)
