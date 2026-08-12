@@ -1,3 +1,6 @@
+import os
+import sys
+
 from ..navigation import GateMission, NavigationController
 
 class MultiStageGateMission(GateMission):

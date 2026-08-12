@@ -1,8 +1,12 @@
+import os
+import sys
+
 from ..navigation import GateMission, NavigationController, GateDetection
+
 class MultiStageGateMission(GateMission):
     """Default race mission that approaches each gate in shrinking stages."""
     
-
+    
     def run(self, nav: NavigationController):
         """Fly the 3m -> 2m -> 1m -> pass-through sequence for up to 8 gates."""
         gateNum : int = 4

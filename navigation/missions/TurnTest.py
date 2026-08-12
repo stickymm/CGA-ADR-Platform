@@ -1,4 +1,8 @@
+import sys
+import os
+
 from Colins_Nav import GateMission, NavigationController, GateDetection
+
 class TurnTest(GateMission):
     def run(self, nav: NavigationController):
         gateNum : int = 1
@@ -14,6 +18,7 @@ class TurnTest(GateMission):
             print("beginning the search")
             gate = self.observe_gate(nav, duration = 3.0)
             nav.turn_test(gate, 3.0)
+            gate += 1
         
         if gate_count >= gateNum:
             nav.land()
