@@ -39,6 +39,14 @@ from .contracts import GateLegConfig, GateResult, summarize_config
 from .gate_leg import approach_and_cross_one_gate
 from .pad import PadConfig, run_pad_sequence
 
+# CODE-LOAD CANARY. Fires the instant this module finishes importing --
+# before argparse, before any mission logic. If you do NOT see this line,
+# Python never successfully loaded this file: the problem is the environment
+# (git pull, venv, working directory, `python -m` invocation), not anything
+# below this point. If you DO see it, everything downstream is real code
+# running, and `__file__` tells you exactly which copy of it.
+print(f"[CODE-CHECK] phase1a_single_gate.py loaded OK from: {__file__}")
+
 MISSION_TITLE = "PHASE 1A -- SINGLE GATE"
 
 
