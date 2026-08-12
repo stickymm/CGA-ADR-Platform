@@ -51,6 +51,14 @@ def _abort(nav, reason: str) -> int:
     """
     try:
         nav.safe_shutdown(reason)
+    except KeyboardInterrupt:
+        # A further interrupt during the shutdown must not escape as a
+        # traceback, and must not trigger a second abort that re-runs the whole
+        # sequence. safe_shutdown has already commanded LAND by this point.
+        print(
+            "[!] Interrupted during safe shutdown. LAND was already commanded -- "
+            "TAKE MANUAL CONTROL AND CHECK THE AIRCRAFT. Not retrying."
+        )
     except Exception as exc:
         print(f"[!] safe_shutdown itself failed: {exc}")
     print(f"\n[RESULT] MISSION ABORTED: {reason}")

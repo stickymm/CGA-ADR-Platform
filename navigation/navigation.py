@@ -163,6 +163,46 @@ STATE_HISTORY_DEPTH = 30
 
 
 # =========================
+# BACKGROUND-THREAD LOGGING
+# =========================
+#
+# Diagnostic chatter from the reader thread lands in the middle of the one
+# blocking prompt the operator ever sees:
+#
+#     Type GO to continue (anything else aborts): [*] PX4 setpoint echo: mask=63
+#
+# Confirmed in a field log, 2026-08-12.  Garbling the single prompt where a
+# mistyped answer aborts the mission is not an acceptable price for a
+# diagnostic line, so purely-informational background logging can be muted for
+# the duration of the prompt.
+#
+# SAFETY MESSAGES ARE NEVER ROUTED THROUGH THIS.  The deadman, the frozen-feed
+# alarm, transmit failures and every abort reason all use bare `print`, so they
+# are never suppressed.  This mutes diagnostics only.
+
+_BACKGROUND_LOG_MUTED = threading.Event()
+
+
+def mute_background_logs() -> None:
+    """Silence purely-diagnostic background-thread logging."""
+    _BACKGROUND_LOG_MUTED.set()
+
+
+def unmute_background_logs() -> None:
+    _BACKGROUND_LOG_MUTED.clear()
+
+
+def background_logs_muted() -> bool:
+    return _BACKGROUND_LOG_MUTED.is_set()
+
+
+def _diagnostic_log(message: str) -> None:
+    """Print unless diagnostics are muted.  Never used for a safety message."""
+    if not _BACKGROUND_LOG_MUTED.is_set():
+        print(message)
+
+
+# =========================
 # DATA TYPES
 # =========================
 
@@ -1171,7 +1211,9 @@ class NavigationController:
             else:
                 return
 
-        print(
+        # Diagnostic, not a safety message: muted while the operator prompt is
+        # blocking so it cannot land in the middle of "Type GO to continue".
+        _diagnostic_log(
             f"[*] PX4 setpoint echo: mask={mask} "
             f"p=({echo[1]:+.2f},{echo[2]:+.2f},{echo[3]:+.2f}) "
             f"v=({echo[4]:+.2f},{echo[5]:+.2f},{echo[6]:+.2f}) "
@@ -1890,16 +1932,32 @@ class NavigationController:
         bounded -- an unbounded hover is not "safe", it is a hover until the
         battery runs out, and streaming zeros the whole time actively defeats
         PX4's own offboard-loss failsafe.
+
+        **THE HOLD IS A COURTESY.  THE LANDING IS NOT OPTIONAL.**
+        A second Ctrl-C during the hold used to raise ``KeyboardInterrupt`` out
+        of ``time.sleep`` and propagate straight past ``return self.land()``, so
+        an impatient operator got an aircraft that was never commanded to land.
+        Confirmed in a field log, 2026-08-12: two interrupts, zero LAND commands
+        sent.  An interrupt now *shortens* the hold rather than cancelling the
+        landing -- it asks for something more urgent, not less.
         """
         print("\n" + "=" * 62)
         print(f"[!] SAFE SHUTDOWN: {reason}")
         print(f"[!] Holding {hold_s:.1f}s -- TAKE MANUAL CONTROL NOW IF REQUIRED")
         print("=" * 62)
 
-        self.hold_position(label=f"safe shutdown: {reason}")
+        try:
+            self.hold_position(label=f"safe shutdown: {reason}")
+        except Exception as exc:
+            # Losing the hold is bad but it must not cost us the landing.
+            print(f"[!] Could not latch the safe-shutdown hold: {exc}")
+
         deadline = time.time() + hold_s
-        while self.running and time.time() < deadline:
-            time.sleep(0.1)
+        try:
+            while self.running and time.time() < deadline:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("[!] Hold interrupted by the operator -- going straight to LAND")
 
         return self.land()
 

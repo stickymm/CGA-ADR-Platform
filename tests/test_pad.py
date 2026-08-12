@@ -97,9 +97,16 @@ class PadNav(FakeNav):
 
 
 class FrozenFeedMission:
-    """A vision feed that is alive, fresh, and saying the same thing forever."""
+    """A vision feed that is alive, fresh, and saying the same thing forever.
 
-    def __init__(self, clock, *, frozen=False, packets=True, fresh=True):
+    ``blind=True`` publishes the all-999 no-detection sentinel: a perfectly
+    healthy publisher that simply cannot see a gate.  ``gate_above=True``
+    publishes the geometry that actually occurs on the pad -- the drone is on
+    the floor and the gate hangs in the air, so ``down`` is strongly negative.
+    """
+
+    def __init__(self, clock, *, frozen=False, packets=True, fresh=True,
+                 blind=False, gate_above=False):
         self.clock = clock
         self.feed_frozen = frozen
         self.identical_frame_count = 15 if frozen else 0
@@ -108,12 +115,27 @@ class FrozenFeedMission:
         self.udp_port = 5050
         self.packets = packets
         self.fresh = fresh
+        self.blind = blind
+        self.gate_above = gate_above
 
     def get_latest_detection_snapshot(self):
         if not self.packets:
             return None
         age = 0.0 if self.fresh else 10.0
-        return detection(timestamp=self.clock.time() - age)
+        stamp = self.clock.time() - age
+        if self.blind:
+            # Exactly what vision/opencv_processing.py pads absent gates with.
+            return detection(
+                timestamp=stamp, dist=999.0, forward=999.0, right=999.0,
+                down=999.0, roll=999.0, pitch=999.0, yaw_deg=999.0,
+            )
+        if self.gate_above:
+            # Field values, 2026-08-12: gate 4.91 m out and 1.58 m ABOVE the
+            # camera while the aircraft sits on the floor.
+            return detection(
+                timestamp=stamp, dist=5.14, forward=4.91, right=0.30, down=-1.58,
+            )
+        return detection(timestamp=stamp)
 
     def start(self):
         pass
@@ -392,10 +414,10 @@ class DetectionWaitTests(unittest.TestCase):
             )
         return ok, log
 
-    def test_a_live_changing_feed_is_accepted(self):
+    def test_a_live_changing_feed_with_a_real_gate_is_accepted(self):
         ok, log = self._wait(FrozenFeedMission(self.clock))
         self.assertTrue(ok)
-        self.assertTrue(log.contains("alive and CHANGING"))
+        self.assertTrue(log.contains("REAL gate"))
 
     def test_silence_is_named_as_silence(self):
         ok, log = self._wait(FrozenFeedMission(self.clock, packets=False))
@@ -411,7 +433,56 @@ class DetectionWaitTests(unittest.TestCase):
         ok, log = self._wait(FrozenFeedMission(self.clock, frozen=True))
         self.assertFalse(ok)
         self.assertTrue(log.contains("FROZEN"))
-        self.assertFalse(log.contains("alive and CHANGING"))
+        self.assertFalse(log.contains("REAL gate"))
+
+    def test_a_blind_feed_of_999_sentinels_is_refused(self):
+        """REGRESSION -- HIGH, field log 2026-08-12.
+
+        The pad printed "Vision feed alive and CHANGING over 1.0s:
+        fwd=+999.00m right=+999.00m down=+999.00m dist=999.00m" and would have
+        taken off. The publisher was healthy and fresh; it simply could not see
+        a gate. wait_for_detections checked `det is not None` and the timestamp
+        age but never `is_valid_detection`, and the frozen-feed detector
+        deliberately ignores all-999 payloads -- so both guards missed the same
+        case at the same time and `require_detections` did nothing.
+        """
+        ok, log = self._wait(FrozenFeedMission(self.clock, blind=True))
+
+        self.assertFalse(ok)
+        self.assertFalse(log.contains("REAL gate"))
+        self.assertTrue(log.contains("NONE carries a gate"))
+        # Named as "blind", not as "stale" -- they send you to check different
+        # things (aim/lighting/range vs. a dead or lagging publisher).
+        self.assertFalse(log.contains("stale or a no-detection row"))
+
+    def test_a_gate_above_the_drone_on_the_pad_is_accepted(self):
+        """The drone starts on the floor and the gate hangs in the air.
+
+        A pad-time detection therefore has a large NEGATIVE `down`. Validity is
+        judged on `dist` alone; nothing here may reject a gate for being high,
+        or the aircraft could never be cleared to fly a real course.
+        """
+        ok, log = self._wait(FrozenFeedMission(self.clock, gate_above=True))
+
+        self.assertTrue(ok, log.text)
+        self.assertTrue(log.contains("REAL gate"))
+        self.assertTrue(log.contains("down=-1.58m"))
+        self.assertTrue(log.contains("gate ABOVE the camera"))
+
+    def test_a_blind_feed_refuses_takeoff_at_the_pad(self):
+        # End to end, not just the helper: require_detections must actually
+        # stop the sequence before the operator is asked to arm.
+        nav = PadNav(self.clock)
+        result, log = run_pad(
+            nav,
+            FrozenFeedMission(self.clock, blind=True),
+            pad_config(detection_wait_s=1.0),
+            self.clock,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("no fresh gate detections", result.reason)
+        self.assertNotIn("wait_for_armed", nav.events)
 
 
 class BannerTests(unittest.TestCase):

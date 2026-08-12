@@ -33,6 +33,9 @@ from ..navigation import (
     NavigationController,
     Setpoint,
     SetpointKind,
+    is_valid_detection,
+    mute_background_logs,
+    unmute_background_logs,
 )
 from .contracts import AltitudeEnvelope
 
@@ -95,11 +98,19 @@ def confirm(prompt: str = "Type GO to continue (anything else aborts): ") -> boo
     armed races PX4's pre-takeoff auto-disarm, and a countdown while disarmed
     just delays the operator for no reason.  A keypress waits exactly as long as
     the human needs.
+
+    Background diagnostics are muted for the duration, because a reader-thread
+    log line printed into the middle of this prompt is how an operator ends up
+    typing their answer into a garbled line.  Safety messages are not muted --
+    they do not go through the diagnostic channel.
     """
+    mute_background_logs()
     try:
         return input(prompt).strip().upper() == "GO"
     except (EOFError, KeyboardInterrupt):
         return False
+    finally:
+        unmute_background_logs()
 
 
 def assert_not_climbing(nav: NavigationController) -> None:
@@ -124,21 +135,38 @@ def wait_for_detections(
     *,
     min_observe_s: float = 1.0,
 ) -> bool:
-    """Confirm the vision process is alive and its detections are fresh.
+    """Confirm the vision process is alive AND actually looking at a gate.
 
-    Distinguishes the four cases the old code conflated: no packets at all
-    (vision is dead or the port is wrong), packets carrying only the 999
-    no-detection sentinel (normal, no gate in view), packets carrying a gate
-    whose pose never changes (a stalled camera -- the failure that looks exactly
-    like health), and fresh real detections.
+    FOUR distinct states, and all four are reported differently:
 
-    Refusing to take off on a frozen feed is the whole point of checking it here:
-    airborne, the same condition costs a recovery ladder and a gate.
+    1. **No packets at all** -- vision is dead, or the port is wrong.
+    2. **Packets carrying only the all-999 no-detection row** -- the publisher is
+       perfectly healthy and simply cannot see a gate.
+    3. **Packets carrying a gate whose pose never changes** -- a stalled camera,
+       the failure that looks exactly like health.  Caught by ``feed_frozen``.
+    4. **Fresh, valid, changing detections** -- the only state that flies.
+
+    THREE conditions must hold, not two.  A packet arriving and being recent is
+    not enough; it must also carry a *real* gate.  Without the
+    ``is_valid_detection`` check below, state 2 was reported as state 4 -- the
+    pad announced "alive and CHANGING" for a feed publishing nothing but 999s
+    and would have taken off with no gate in view, which is precisely what
+    ``require_detections`` exists to prevent.  Confirmed in a field log,
+    2026-08-12.
+
+    NOTE ON GEOMETRY: validity is judged on ``dist`` alone.  The drone sits on
+    the floor while the gate hangs in the air, so a healthy pad-time detection
+    has a large NEGATIVE ``down`` (the gate is above the camera).  Nothing here
+    may reject a detection for being high -- the altitude envelope is applied
+    later, in ``localize_gate``, against the latched pad reference.
     """
     deadline = time.time() + wait_s
     saw_packet = False
-    first_fresh_s = None
+    saw_fresh = False
+    saw_valid = False
+    first_valid_s = None
     latest = None
+    age = 0.0
 
     while nav.running and time.time() < deadline:
         if getattr(mission, "feed_frozen", False):
@@ -154,27 +182,42 @@ def wait_for_detections(
             saw_packet = True
             age = time.time() - det.timestamp
             if age <= mission.detection_max_age_s:
+                saw_fresh = True
+            if is_valid_detection(det) and age <= mission.detection_max_age_s:
+                saw_valid = True
                 latest = det
-                if first_fresh_s is None:
-                    first_fresh_s = time.time()
+                if first_valid_s is None:
+                    first_valid_s = time.time()
                 # Watch for a full frozen-detection window before declaring the
-                # feed healthy. Returning on the first fresh packet would pass a
+                # feed healthy. Returning on the first good packet would pass a
                 # stalled camera every time -- it publishes fresh packets, they
                 # just all say the same thing.
-                elif time.time() - first_fresh_s >= min_observe_s:
+                elif time.time() - first_valid_s >= min_observe_s:
                     log(
-                        f"[*] Vision feed alive and CHANGING over {min_observe_s:.1f}s: "
-                        f"fwd={latest.forward:+.2f}m right={latest.right:+.2f}m "
-                        f"down={latest.down:+.2f}m yaw={latest.yaw_deg:+.1f}deg "
-                        f"dist={latest.dist:.2f}m (age {age*1000:.0f}ms)"
+                        f"[*] Vision feed alive with a REAL gate over "
+                        f"{min_observe_s:.1f}s: fwd={latest.forward:+.2f}m "
+                        f"right={latest.right:+.2f}m down={latest.down:+.2f}m "
+                        f"(negative down = gate ABOVE the camera) "
+                        f"yaw={latest.yaw_deg:+.1f}deg dist={latest.dist:.2f}m "
+                        f"(age {age*1000:.0f}ms)"
                     )
                     return True
         time.sleep(0.05)
 
-    if first_fresh_s is not None:
+    # Four distinct diagnoses, because in the field they mean four different
+    # things to go and check.
+    if saw_valid:
         log(
-            f"[!] Vision feed produced fresh detections but not for the full "
-            f"{min_observe_s:.1f}s freshness window inside the {wait_s:.1f}s budget."
+            f"[!] A real gate was seen, but not continuously for the full "
+            f"{min_observe_s:.1f}s window inside the {wait_s:.1f}s budget. Hold "
+            f"the aircraft steady with the gate in frame and try again."
+        )
+    elif saw_fresh:
+        log(
+            "[!] Vision packets are fresh but NONE carries a gate -- every row is "
+            "the all-999 no-detection sentinel. The camera pipeline is alive and "
+            "healthy; it simply cannot see a gate from where the aircraft is "
+            "sitting. Check aim, lighting, and range."
         )
     elif saw_packet:
         log("[!] Vision packets are arriving but every one is stale or a no-detection row.")

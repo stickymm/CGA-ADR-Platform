@@ -150,6 +150,172 @@ class LandingBudgetTests(unittest.TestCase):
         self.assertLess(self.clock.slept, 1.0)
 
 
+class SafeShutdownInterruptTests(unittest.TestCase):
+    """HIGH -- a second Ctrl-C during the hold skipped the landing entirely."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.link = RecordingLink()
+        self.nav = controller(link=self.link)
+        self.nav._vehicle = VehicleState(
+            armed=True, landed_state=2, heartbeat_received_s=1.0,
+            have_local_position=True, have_attitude=True,
+        )
+
+    def test_an_interrupt_during_the_hold_still_commands_land(self):
+        """THE BUG, from a field log 2026-08-12.
+
+        safe_shutdown held for 3 s in a `time.sleep` loop and only then called
+        land(). The signal handler raises KeyboardInterrupt into the main
+        thread, which propagated straight past `return self.land()` -- and
+        _abort's `except Exception` does not catch KeyboardInterrupt because it
+        is a BaseException. Two impatient interrupts produced an abort that
+        never transmitted a single LAND command.
+
+        The hold is a courtesy. The landing is not optional.
+        """
+        interrupting = FakeClock()
+
+        def sleep_then_interrupt(seconds):
+            raise KeyboardInterrupt
+
+        interrupting.sleep = sleep_then_interrupt
+
+        with patch.object(nav_module, "time", interrupting), \
+             patch.object(self.nav, "land", return_value=True) as landed:
+            result = self.nav.safe_shutdown("operator interrupt")
+
+        self.assertTrue(result)
+        landed.assert_called_once()
+
+    def test_the_interrupt_is_announced_rather_than_swallowed_silently(self):
+        interrupting = FakeClock()
+        interrupting.sleep = lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt)
+
+        with patch.object(nav_module, "time", interrupting), \
+             patch.object(self.nav, "land", return_value=True), \
+             patch("builtins.print") as printed:
+            self.nav.safe_shutdown("operator interrupt")
+
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("Hold interrupted", output)
+        self.assertIn("straight to LAND", output)
+
+    def test_a_failed_hold_does_not_cost_the_landing(self):
+        # Losing the brake-and-hold setpoint is bad. Losing the landing is
+        # worse, so a failure here must not short-circuit the shutdown.
+        with patch.object(nav_module, "time", self.clock), \
+             patch.object(self.nav, "hold_position",
+                          side_effect=RuntimeError("no link")), \
+             patch.object(self.nav, "land", return_value=True) as landed:
+            self.nav.safe_shutdown("telemetry lost")
+
+        landed.assert_called_once()
+
+    def test_the_normal_path_still_holds_for_the_full_window(self):
+        with patch.object(nav_module, "time", self.clock), \
+             patch.object(self.nav, "land", return_value=True) as landed:
+            self.nav.safe_shutdown("gate not crossed", hold_s=3.0)
+
+        self.assertGreaterEqual(self.clock.slept, 2.9)
+        landed.assert_called_once()
+
+    def test_abort_does_not_let_a_further_interrupt_escape(self):
+        # phase1a/1b/2 all share this shape: an interrupt raised while
+        # safe_shutdown is running used to propagate out of _abort as an
+        # unhandled traceback, and in main's handler it triggered a SECOND
+        # full abort.
+        from navigation.missions import phase1a_single_gate
+
+        nav = controller(link=RecordingLink())
+        with patch.object(nav, "safe_shutdown", side_effect=KeyboardInterrupt), \
+             patch("builtins.print") as printed:
+            code = phase1a_single_gate._abort(nav, "operator interrupt")
+
+        self.assertEqual(code, 1)
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("LAND was already commanded", output)
+
+
+class BackgroundLogMutingTests(unittest.TestCase):
+    """The operator prompt is the one line that must not be garbled."""
+
+    def tearDown(self):
+        nav_module.unmute_background_logs()
+
+    def test_the_setpoint_echo_is_muted_while_muting_is_active(self):
+        """REGRESSION -- field log 2026-08-12.
+
+        `Type GO to continue (anything else aborts): [*] PX4 setpoint echo: ...`
+        The reader thread printed into the middle of the single blocking prompt
+        where a mistyped answer aborts the mission.
+        """
+        nav = controller()
+        message = _EchoMessage()
+
+        nav_module.mute_background_logs()
+        with patch("builtins.print") as printed:
+            nav._record_setpoint_echo(message, now=100.0)
+        self.assertEqual(printed.call_count, 0)
+
+        # And it is not lost -- the value is still recorded for setpoint_echo().
+        self.assertIsNotNone(nav.setpoint_echo())
+
+    def test_the_echo_prints_again_once_unmuted(self):
+        nav = controller()
+        nav_module.unmute_background_logs()
+
+        with patch("builtins.print") as printed:
+            nav._record_setpoint_echo(_EchoMessage(), now=100.0)
+
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("PX4 setpoint echo", output)
+
+    def test_confirm_mutes_and_always_unmutes(self):
+        from navigation.missions import pad
+
+        with patch("builtins.input", return_value="GO"):
+            self.assertTrue(pad.confirm())
+        self.assertFalse(nav_module.background_logs_muted())
+
+        # Even when the operator aborts with Ctrl-C at the prompt.
+        with patch("builtins.input", side_effect=KeyboardInterrupt):
+            self.assertFalse(pad.confirm())
+        self.assertFalse(nav_module.background_logs_muted())
+
+    def test_safety_messages_are_never_routed_through_the_muted_channel(self):
+        # The deadman must still shout while muted -- it uses bare print.
+        nav = controller()
+        with nav._setpoint_lock:
+            nav._setpoint = Setpoint(
+                kind=SetpointKind.VELOCITY_YAW, vn=0.4, label="approach",
+                issued_s=-10_000.0,
+            )
+        nav._vehicle = VehicleState(
+            armed=True, custom_mode=nav_module.PX4_CUSTOM_MAIN_MODE_OFFBOARD << 16
+        )
+
+        nav_module.mute_background_logs()
+        link = RecordingLink(stop_after=2, stop_event=nav._stream_enabled)
+        nav.link = link
+        nav._stream_enabled.set()
+        with patch.object(nav_module, "time", FakeClock()), \
+             patch("builtins.print") as printed:
+            nav._setpoint_streamer()
+
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("DEADMAN", output)
+
+
+class _EchoMessage:
+    """A minimal POSITION_TARGET_LOCAL_NED stand-in."""
+
+    type_mask = 2503
+    x = y = z = 0.0
+    vx = vy = vz = 0.0
+    yaw = 0.0
+
+
 class DeadmanTests(unittest.TestCase):
     """HIGH -- the deadman cried wolf on the pad before every single flight."""
 
