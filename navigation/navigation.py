@@ -367,11 +367,11 @@ class NavigationController:
             n=state.n,
             e=state.e,
             d=state.d,
-            yaw_rad=wrap_pi(state.yaw_rad + math.pi/2),
+            yaw_rad=wrap_pi(state.yaw_rad - math.pi/2),
         )
         self.move_to_target(target, "90 Degree Turn")
 
-    def turn_around_45(self):
+    def turn_around_45_L(self):
         """Hold position and command a 180-degree yaw change."""
         print("[*] 0 Gate Detections! Turning 45 degrees...")
 
@@ -380,7 +380,7 @@ class NavigationController:
             n=state.n,
             e=state.e,
             d=state.d,
-            yaw_rad=wrap_pi(state.yaw_rad + math.pi/4),
+            yaw_rad=wrap_pi(state.yaw_rad - math.pi/4),
         )
         self.move_to_target(target, "45 Degree Turn")
 
