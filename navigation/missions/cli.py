@@ -136,8 +136,20 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
              "MPC_YAWRAUTO_MAX for this -- fast yaw degrades optical flow",
     )
     limits.add_argument("--max-observe-retries", type=int, default=3)
-    limits.add_argument("--max-scan-sweeps", type=int, default=2)
-    limits.add_argument("--scan-half-angle-deg", type=float, default=45.0)
+    limits.add_argument("--max-scan-sweeps", type=int, default=2,
+                        help="each sweep observes at every heading, and sweep N "
+                             "looks N x --scan-half-angle-deg wide")
+    limits.add_argument("--scan-half-angle-deg", type=float, default=45.0,
+                        help="first-sweep half angle. A zig-zag needs ~45; a box "
+                             "course turns ~90, which sweep 2 reaches")
+    limits.add_argument(
+        "--crossed-gate-avoid-m",
+        type=float,
+        default=0.8,
+        help="multi-gate: reject a fix this close to the gate just crossed, "
+             "so one gate cannot be flown and counted twice. 0 disables -- "
+             "needed only if two gates genuinely sit within a metre",
+    )
     limits.add_argument("--backoff-distance-m", type=float, default=1.0)
     limits.add_argument("--max-backoffs", type=int, default=2)
 
@@ -219,6 +231,7 @@ def build_leg_config(args, envelope: AltitudeEnvelope) -> GateLegConfig:
         max_detection_age_s=args.max_detection_age_s,
         arrival_tolerance_m=args.arrival_tolerance_m,
         vertical_step_m=args.vertical_step_m,
+        crossed_gate_avoid_m=args.crossed_gate_avoid_m,
         min_observation_samples=args.min_observation_samples,
         altitude=envelope,
     )

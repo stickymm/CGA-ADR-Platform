@@ -25,6 +25,7 @@ from support import (  # noqa: E402
 from navigation.missions import gate_leg  # noqa: E402
 from navigation.missions.contracts import (  # noqa: E402
     AltitudeEnvelope,
+    GateFix,
     GateLegConfig,
     GateResult,
 )
@@ -57,6 +58,17 @@ def run_leg(nav, mission, cfg, clock, log=None):
             nav, mission, cfg, gate_index=0, log=log
         )
     return outcome, log
+
+
+def gate_fix(n, e, d=-1.5, *, normal=(1.0, 0.0)) -> GateFix:
+    """A minimal localized gate, for the crossed-gate guard tests."""
+    return GateFix(
+        n=n, e=e, d=d, normal_n=normal[0], normal_e=normal[1],
+        yaw_rad=math.atan2(normal[1], normal[0]), range_m=1.0,
+        lateral_body_m=0.0, vertical_body_m=0.0, lateral_axis_m=0.0,
+        cone_angle_deg=0.0, normal_flipped=False, altitude_clamped=False,
+        low_confidence=False, reason="",
+    )
 
 
 # A gate close enough and centred enough that the commit gate passes.
@@ -253,8 +265,66 @@ class RecoveryLadderTests(unittest.TestCase):
 
         self.assertIs(outcome.result, GateResult.CROSSED)
         self.assertTrue(log.contains("Recovery rung 2: yaw sweep 1/2"))
-        # +45, -45, back to 0 -- three commanded headings, all rate limited.
+        # The sweep OBSERVES at each heading and stops at the one where it sees
+        # the gate. Here the gate is visible from the very first heading, so a
+        # single slew is issued and the aircraft stays pointed at it.
+        self.assertEqual(len(self.nav.slews), 1)
+        self.assertTrue(log.contains("Gate re-acquired"))
+        self.assertTrue(log.contains("staying here"))
+
+    def test_a_sweep_that_finds_nothing_returns_to_the_search_heading(self):
+        # +45, -45, then back to where it started -- three commanded headings.
+        mission = ScriptedMission([None])
+        outcome, log = run_leg(
+            self.nav,
+            mission,
+            leg_config(max_observe_retries=1, max_scan_sweeps=1, max_backoffs=0),
+            self.clock,
+        )
+
+        self.assertIs(outcome.result, GateResult.NOT_FOUND)
         self.assertEqual(len(self.nav.slews), 3)
+        self.assertAlmostEqual(self.nav.slews[-1][1], 0.0, places=6)
+        self.assertTrue(log.contains("returning to the search heading"))
+
+    def test_the_sweep_actually_looks_rather_than_just_turning(self):
+        """REGRESSION -- multi-gate prep, 2026-08-13.
+
+        `_yaw_sweep` used to slew to +45, then -45, then back to 0 and never
+        call observe_gate once. It rotated, came back, and the caller
+        re-observed at exactly the heading that had already failed. Recovery
+        rung 2 could only ever succeed by coincidence -- it was incapable of
+        finding a gate that was not already in front of the aircraft. Harmless
+        on a straight-line course, useless on any course with a turn in it.
+        """
+        mission = ScriptedMission([None, None, COMMITTABLE])
+        before = mission.observations
+        run_leg(
+            self.nav,
+            mission,
+            leg_config(max_observe_retries=1, max_scan_sweeps=1),
+            self.clock,
+        )
+        # Observations happened DURING the sweep, not only around it.
+        self.assertGreater(mission.observations, before + 2)
+
+    def test_the_second_sweep_looks_twice_as_wide(self):
+        # A zig-zag puts the next gate inside the first band; a box course turns
+        # about 90 degrees, which only the widened second band reaches.
+        mission = ScriptedMission([None])
+        run_leg(
+            self.nav,
+            mission,
+            leg_config(
+                max_observe_retries=1, max_scan_sweeps=2, max_backoffs=0,
+                scan_half_angle_deg=45.0,
+            ),
+            self.clock,
+        )
+
+        headings = [abs(math.degrees(heading)) for _label, heading, _rate in self.nav.slews]
+        self.assertTrue(any(abs(h - 45.0) < 1e-6 for h in headings), headings)
+        self.assertTrue(any(abs(h - 90.0) < 1e-6 for h in headings), headings)
 
     def test_the_yaw_sweep_is_rate_limited_by_this_code(self):
         """REGRESSION -- PROJECT_STATE gap 3: yaw-rate limiting was absent.
@@ -298,6 +368,47 @@ class RecoveryLadderTests(unittest.TestCase):
         self.assertTrue(any("back-off" in label for label, *_ in self.nav.moves))
         self.assertIs(outcome.result, GateResult.LOST)
 
+    def test_rung_three_backs_off_even_when_the_gate_was_never_localized(self):
+        """REGRESSION -- multi-gate prep, 2026-08-13.
+
+        Rung 3 was guarded on `last_fix is not None`, so a gate that had never
+        been localized could not be backed away from. That is exactly backwards:
+        the most likely reason a gate is invisible is that the aircraft is too
+        close for it to fit in frame -- the vision process refuses to solve a
+        pose for any box touching the image edge -- and on a multi-gate course
+        you can finish a crossing sitting right on top of the next gate.
+        Retreating is the only useful thing left to try, and it was the one
+        thing forbidden.
+        """
+        outcome, log = run_leg(
+            self.nav,
+            ScriptedMission([None]),
+            leg_config(max_observe_retries=1, max_scan_sweeps=1, max_backoffs=1),
+            self.clock,
+        )
+
+        self.assertTrue(log.contains("gate never localized, backing straight off"))
+        self.assertTrue(any("back-off" in label for label, *_ in self.nav.moves))
+        self.assertIs(outcome.result, GateResult.NOT_FOUND)
+
+    def test_the_blind_backoff_retreats_along_the_drones_own_heading(self):
+        self.nav.set_state(n=0.0, e=0.0, d=-1.5, yaw_rad=0.0)   # pointing north
+        run_leg(
+            self.nav,
+            ScriptedMission([None]),
+            leg_config(
+                max_observe_retries=1, max_scan_sweeps=0, max_backoffs=1,
+                backoff_distance_m=1.0,
+            ),
+            self.clock,
+        )
+
+        backoffs = [t for label, t, *_ in self.nav.moves if "back-off" in label]
+        self.assertTrue(backoffs)
+        # Straight backwards: one metre south of where it was, same altitude.
+        self.assertAlmostEqual(backoffs[0].n, -1.0, places=6)
+        self.assertAlmostEqual(backoffs[0].e, 0.0, places=6)
+
     def test_a_gate_never_seen_at_all_is_not_found_not_lost(self):
         # NOT_FOUND and LOST are different diagnoses: one says the search was
         # wrong, the other says the approach was.
@@ -323,6 +434,63 @@ class RecoveryLadderTests(unittest.TestCase):
         )
         self.assertIn(outcome.result, (GateResult.NOT_FOUND, GateResult.LOST))
         self.assertLessEqual(len(self.nav.slews), 3 * 2)
+
+
+class CrossedGateGuardTests(unittest.TestCase):
+    """Multi-gate: a gate must not be counted, or flown, twice."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.nav = FakeNav(self.clock)
+        self.nav.integrate_velocity = True
+
+    def _run(self, avoid_gate, script, **cfg_overrides):
+        log = RecordingLog()
+        with patch.object(gate_leg, "time", self.clock):
+            outcome = gate_leg.approach_and_cross_one_gate(
+                self.nav,
+                ScriptedMission(script),
+                leg_config(**cfg_overrides),
+                gate_index=1,
+                log=log,
+                avoid_gate=avoid_gate,
+            )
+        return outcome, log
+
+    def test_re_detecting_the_gate_just_crossed_is_refused(self):
+        # COMMITTABLE localizes to (0.9, 0, -1.5) from a drone at the origin.
+        # Tell the leg that IS the gate it already flew through.
+        outcome, log = self._run(
+            gate_fix(0.9, 0.0), [COMMITTABLE], crossed_gate_avoid_m=0.8
+        )
+
+        self.assertIs(outcome.result, GateResult.NOT_FOUND)
+        self.assertTrue(log.contains("almost certainly the SAME gate"))
+        self.assertIn("only ever re-detected the gate already crossed", outcome.reason)
+
+    def test_a_genuinely_different_gate_is_accepted(self):
+        # The previous gate is 5 m away; this fix is nothing to do with it.
+        outcome, _ = self._run(
+            gate_fix(-5.0, 0.0), [COMMITTABLE], crossed_gate_avoid_m=0.8
+        )
+        self.assertIs(outcome.result, GateResult.CROSSED)
+
+    def test_the_guard_can_be_disabled_for_tightly_spaced_courses(self):
+        # A course with two gates genuinely within a metre needs this off.
+        outcome, _ = self._run(
+            gate_fix(0.9, 0.0), [COMMITTABLE], crossed_gate_avoid_m=0.0
+        )
+        self.assertIs(outcome.result, GateResult.CROSSED)
+
+    def test_phase_1a_passes_nothing_and_nothing_is_checked(self):
+        log = RecordingLog()
+        with patch.object(gate_leg, "time", self.clock):
+            outcome = gate_leg.approach_and_cross_one_gate(
+                self.nav, ScriptedMission([COMMITTABLE]), leg_config(),
+                gate_index=0, log=log,
+            )
+        self.assertIs(outcome.result, GateResult.CROSSED)
+        self.assertFalse(log.contains("SAME gate"))
 
 
 class AbortAndDeadlineTests(unittest.TestCase):

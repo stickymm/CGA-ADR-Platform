@@ -220,6 +220,15 @@ class GateLegConfig:
     # smaller than any sane gate spacing.
     expected_gate_radius_m: float = 2.0
 
+    # --- multi-gate seam ---
+    # How close a new fix may be to the gate just crossed before it is treated
+    # as that same gate seen again rather than the next one. Only used when a
+    # caller passes `avoid_gate=`; Phase 1A never does. Sized well under any
+    # sane gate spacing and well over the localization noise seen in flight
+    # (~0.3 m). Set to 0.0 to disable -- which is the right move on a course
+    # where two gates genuinely sit within a metre of each other.
+    crossed_gate_avoid_m: float = 0.8
+
     # --- freshness ---
     max_detection_age_s: float = 0.4
     max_telemetry_age_s: float = 0.5

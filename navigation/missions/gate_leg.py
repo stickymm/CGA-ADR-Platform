@@ -46,6 +46,7 @@ from ..navigation import (
 from .contracts import GateFix, GateLegConfig, GateOutcome, GateResult
 from .frames import (
     backoff_target,
+    clamp_altitude,
     crossed_gate_plane,
     evaluate_commit,
     limit_approach_step,
@@ -65,6 +66,7 @@ def approach_and_cross_one_gate(
     gate_index: int = 0,
     log: LogFn = print,
     expected_gate: Optional[GateFix] = None,
+    avoid_gate: Optional[GateFix] = None,
     exit_leg: Optional[Callable[[NavigationController, GateFix], bool]] = None,
 ) -> GateOutcome:
     """Fly one gate.  Always returns; never raises for an in-flight condition.
@@ -80,6 +82,17 @@ def approach_and_cross_one_gate(
         a doorway than it is to be evidence that the mission was wrong.  Acting
         on it means flying at the wrong thing with full confidence; refusing it
         costs one observation.
+
+    ``avoid_gate``
+        A gate this leg must NOT fly again -- in practice the one just crossed.
+        Any fix landing within ``cfg.crossed_gate_avoid_m`` of it is discarded.
+
+        Phase 1 has no gate identity: it takes the nearest row from the vision
+        feed and trusts it.  On a course that is almost always right, because a
+        forward-facing camera cannot see a gate it has just flown through.
+        "Almost always" is doing real work in that sentence, and the failure it
+        allows is not a crash -- it is a course that reports four gates crossed
+        having flown two of them twice.  This is the cheap guard against that.
 
     ``exit_leg``
         What to do once the plane is crossed, replacing the default "hold".
@@ -99,6 +112,7 @@ def approach_and_cross_one_gate(
     align_attempts = 0
     observe_failures = 0
     expected_mismatches = 0
+    avoid_rejections = 0
     scans_used = 0
     backoffs_used = 0
     reacquires = 0
@@ -165,18 +179,48 @@ def approach_and_cross_one_gate(
             if scans_used < cfg.max_scan_sweeps:
                 scans_used += 1
                 observe_failures = 0
-                log(f"[*] Recovery rung 2: yaw sweep {scans_used}/{cfg.max_scan_sweeps}")
-                _yaw_sweep(nav, cfg, log=log)
+                log(
+                    f"[*] Recovery rung 2: yaw sweep {scans_used}/{cfg.max_scan_sweeps} "
+                    f"(+/-{min(180.0, cfg.scan_half_angle_deg * scans_used):.0f}deg, "
+                    f"observing at each heading)"
+                )
+                _yaw_sweep(nav, mission, cfg, scans_used, log=log)
                 continue
 
-            if last_fix is not None and backoffs_used < cfg.max_backoffs:
+            if backoffs_used < cfg.max_backoffs:
                 backoffs_used += 1
                 observe_failures = 0
-                log(f"[*] Recovery rung 3: backing off {cfg.backoff_distance_m:.2f} m")
-                nav.move_to_target(
-                    backoff_target(
+                if last_fix is not None:
+                    log(
+                        f"[*] Recovery rung 3: backing off {cfg.backoff_distance_m:.2f} m "
+                        f"along the gate normal"
+                    )
+                    target = backoff_target(
                         last_fix, nav.get_vehicle_snapshot(), cfg.backoff_distance_m, envelope
-                    ),
+                    )
+                else:
+                    # This gate has NEVER been localized, so there is no normal to
+                    # retreat along -- and the most likely reason a gate is
+                    # invisible from here is that it is too close to fit in frame
+                    # (the vision process refuses to solve a pose for any box
+                    # touching the image edge). Retreating along our own heading
+                    # widens the view, which is the only useful thing left to try.
+                    # Requiring a fix here meant a gate the drone had finished a
+                    # crossing on top of could never be recovered at all.
+                    state = nav.get_vehicle_snapshot()
+                    backed_d, _ = clamp_altitude(state.d, envelope)
+                    target = LocalTarget(
+                        n=state.n - cfg.backoff_distance_m * math.cos(state.yaw_rad),
+                        e=state.e - cfg.backoff_distance_m * math.sin(state.yaw_rad),
+                        d=backed_d,
+                        yaw_rad=state.yaw_rad,
+                    )
+                    log(
+                        f"[*] Recovery rung 3: gate never localized, backing straight "
+                        f"off {cfg.backoff_distance_m:.2f} m to widen the view"
+                    )
+                nav.move_to_target(
+                    target,
                     f"gate {gate_index} back-off",
                     max_speed_m_s=cfg.approach_speed_m_s,
                     tolerance_m=cfg.arrival_tolerance_m,
@@ -206,6 +250,28 @@ def approach_and_cross_one_gate(
             cam_yaw_offset_deg=mission.cam_yaw_offset_deg,
             max_cone_deg=cfg.commit_max_cone_deg,
         )
+
+        if avoid_gate is not None and cfg.crossed_gate_avoid_m > 0.0:
+            separation = math.dist(
+                (fix.n, fix.e, fix.d),
+                (avoid_gate.n, avoid_gate.e, avoid_gate.d),
+            )
+            if separation < cfg.crossed_gate_avoid_m:
+                avoid_rejections += 1
+                log(
+                    f"[!] Gate {gate_index}: this fix is only {separation:.2f} m from "
+                    f"the gate just crossed (limit {cfg.crossed_gate_avoid_m:.2f} m) -- "
+                    f"almost certainly the SAME gate, not the next one. Discarding "
+                    f"({avoid_rejections}/{cfg.max_observe_retries + 1})."
+                )
+                if avoid_rejections > cfg.max_observe_retries:
+                    return finish(
+                        GateResult.NOT_FOUND,
+                        f"only ever re-detected the gate already crossed "
+                        f"(last {separation:.2f} m from it); the next gate is not "
+                        f"visible from here",
+                    )
+                continue
 
         if expected_gate is not None:
             strayed = math.dist(
@@ -339,32 +405,71 @@ def _log_fix(fix: GateFix, state, gate_index: int, attempt: int, envelope, log: 
         log(f"    LOW CONFIDENCE: {fix.reason}")
 
 
-def _yaw_sweep(nav: NavigationController, cfg: GateLegConfig, *, log: LogFn = print) -> None:
-    """Sweep the nose either side of its current heading, looking for the gate.
+def _yaw_sweep(
+    nav: NavigationController,
+    mission,
+    cfg: GateLegConfig,
+    sweep_index: int,
+    *,
+    log: LogFn = print,
+) -> bool:
+    """Sweep the nose either side of its heading, LOOKING as it goes.
 
-    Rate-limited on purpose, and now actually rate-limited by *this* code rather
-    than by hoping PX4's ``MPC_YAWRAUTO_MAX`` is still at its default.  On an
-    optical-flow airframe a fast yaw injects rotation-induced flow that the
-    estimator has to cancel with gyro data alone, and degrading the position
-    estimate during a *recovery* would be exactly the wrong trade.
+    Returns True when a gate was seen, in which case the aircraft is left
+    pointed at it.  Returns False having restored the original heading.
 
-    The previous version issued each +/-45 degree step as a single
-    ``move_to_target`` with a new absolute yaw, i.e. "turn there as fast as you
-    like".  ``slew_yaw`` ramps the commanded heading at
-    ``cfg.max_yaw_rate_deg_s`` instead.
+    IT HAS TO OBSERVE, AND IT DID NOT
+        The previous version slewed to +45, then -45, then back to 0 -- and
+        never once called ``observe_gate``.  It rotated, came back, and the
+        caller then re-observed at exactly the heading that had already failed.
+        Recovery rung 2 could therefore only ever succeed by coincidence: it was
+        incapable of finding a gate that was not already in front of the
+        aircraft.  Harmless on a straight-line course, useless on any course
+        with a turn in it.
+
+    PROGRESSIVE WIDENING
+        Sweep 1 looks +/- ``scan_half_angle_deg``; sweep 2 looks twice as wide.
+        A zig-zag puts the next gate within the first band.  A box course turns
+        about 90 degrees, which only the second band reaches -- which is the
+        whole reason the widening exists.
+
+    Rate-limited by *this* code rather than by hoping PX4's ``MPC_YAWRAUTO_MAX``
+    is still at its default.  On an optical-flow airframe a fast yaw injects
+    rotation-induced flow the estimator must cancel from gyro data alone, and
+    degrading the position estimate during a *recovery* is exactly the wrong
+    trade.
     """
-    state = nav.get_vehicle_snapshot()
-    half = math.radians(cfg.scan_half_angle_deg)
+    origin = nav.get_vehicle_snapshot()
+    half_deg = min(180.0, cfg.scan_half_angle_deg * max(1, sweep_index))
 
-    for offset in (+half, -half, 0.0):
+    for offset_deg in (+half_deg, -half_deg):
         if not nav.running:
-            return
-        heading = wrap_pi(state.yaw_rad + offset)
+            return False
+        heading = wrap_pi(origin.yaw_rad + math.radians(offset_deg))
         nav.slew_yaw(
             heading,
-            label=f"scan to {math.degrees(heading):+.0f}deg",
+            label=f"scan {offset_deg:+.0f}deg off search heading",
             max_rate_deg_s=cfg.max_yaw_rate_deg_s,
         )
+        if not nav.running:
+            return False
+
+        # LOOK. This is the line whose absence made the whole rung decorative.
+        if mission.observe_gate(nav, duration=cfg.observation_duration_s) is not None:
+            log(
+                f"[*] Gate re-acquired {offset_deg:+.0f} deg off the search heading; "
+                f"staying here"
+            )
+            return True
+
+    if nav.running:
+        log(f"[!] Nothing found within +/-{half_deg:.0f} deg; returning to the search heading")
+        nav.slew_yaw(
+            origin.yaw_rad,
+            label="scan return",
+            max_rate_deg_s=cfg.max_yaw_rate_deg_s,
+        )
+    return False
 
 
 def _fly_through_gate(

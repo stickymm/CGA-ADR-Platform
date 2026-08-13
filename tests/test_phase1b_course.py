@@ -84,8 +84,9 @@ class CourseLoopTests(unittest.TestCase):
     def _run(self, scripted, course_cfg):
         calls = []
 
-        def fake_attempt(nav, mission, cfg, *, gate_index=0, log=print):
-            calls.append(gate_index)
+        def fake_attempt(nav, mission, cfg, *, gate_index=0, log=print,
+                         avoid_gate=None, expected_gate=None, exit_leg=None):
+            calls.append((gate_index, avoid_gate))
             return scripted.pop(0)
 
         with patch.object(phase1b_course, "run_pad_sequence",
@@ -95,11 +96,11 @@ class CourseLoopTests(unittest.TestCase):
             code = phase1b_course.run(
                 self.nav, object(), self.leg_cfg, self.pad_cfg, course_cfg
             )
-        return code, calls
+        return code, [index for index, _ in calls], calls
 
     def test_a_clean_course_crosses_every_gate_and_lands_once(self):
         scripted = [outcome(GateResult.CROSSED, i) for i in range(3)]
-        code, calls = self._run(scripted, CourseConfig(gate_count=3, gate_retries=0))
+        code, calls, detailed = self._run(scripted, CourseConfig(gate_count=3, gate_retries=0))
 
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1, 2])
@@ -120,7 +121,7 @@ class CourseLoopTests(unittest.TestCase):
             outcome(GateResult.CROSSED, 0),
             outcome(GateResult.CROSSED, 1),
         ]
-        code, calls = self._run(scripted, CourseConfig(gate_count=2, gate_retries=1))
+        code, calls, detailed = self._run(scripted, CourseConfig(gate_count=2, gate_retries=1))
 
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 0, 1])
@@ -130,7 +131,7 @@ class CourseLoopTests(unittest.TestCase):
         # multi_stage_gate.py landed only on completing all eight gates; every
         # other exit left the vehicle in offboard. Every exit here lands.
         scripted = [outcome(GateResult.NO_COMMIT, 0), outcome(GateResult.NO_COMMIT, 1)]
-        code, calls = self._run(
+        code, calls, detailed = self._run(
             scripted,
             CourseConfig(gate_count=4, gate_retries=0, max_consecutive_failures=2),
         )
@@ -148,7 +149,7 @@ class CourseLoopTests(unittest.TestCase):
             outcome(GateResult.NO_COMMIT, 2),
             outcome(GateResult.CROSSED, 3),
         ]
-        code, calls = self._run(
+        code, calls, detailed = self._run(
             scripted,
             CourseConfig(gate_count=4, gate_retries=0, max_consecutive_failures=2),
         )
@@ -164,7 +165,7 @@ class CourseLoopTests(unittest.TestCase):
         # ABORTED means the vehicle or link is unhealthy; retrying would be
         # commanding motion in a state we already decided we do not trust.
         scripted = [outcome(GateResult.ABORTED, 0, "telemetry stale")]
-        code, calls = self._run(
+        code, calls, detailed = self._run(
             scripted, CourseConfig(gate_count=3, gate_retries=2)
         )
 

@@ -52,7 +52,12 @@ class CourseConfig:
     gate_count: int = 3
     gate_retries: int = 1
     max_consecutive_failures: int = 2
-    course_timeout_s: float = 600.0
+    # A FLIGHT budget, measured from takeoff (see run()). 480 s is roughly a
+    # realistic airborne endurance for this class of aircraft, and a 4-gate
+    # course that is still going at 8 minutes has something wrong with it --
+    # landing with battery left is the right answer. PX4's own
+    # COM_LOW_BAT_ACT remains the real backstop.
+    course_timeout_s: float = 480.0
     settle_between_gates_s: float = 1.0
 
     def __post_init__(self) -> None:
@@ -125,11 +130,13 @@ def run(
     local, Ctrl-C after two crossed gates printed "no gates were attempted".
     """
 
-    started_s = time.time()
     if results is None:
         results = []
     crossed = 0
     consecutive_failures = 0
+    # The gate most recently flown through, so the next leg can refuse to fly it
+    # a second time. Phase 1 has no gate identity; this is the substitute.
+    last_crossed_fix = None
 
     # ---- 1. pad sequence: link, telemetry, vision, stream, confirm, arm, climb
     pad = run_pad_sequence(
@@ -140,12 +147,21 @@ def run(
             ("course gates", f"{course_cfg.gate_count}"),
             ("retries per gate", f"{course_cfg.gate_retries}"),
             ("give up after", f"{course_cfg.max_consecutive_failures} consecutive failures"),
-            ("course timeout", f"{course_cfg.course_timeout_s:.0f} s"),
+            ("course timeout", f"{course_cfg.course_timeout_s:.0f} s airborne"),
+            ("crossed-gate guard", f"{leg_cfg.crossed_gate_avoid_m:.2f} m "
+                                   f"(0 disables)"),
         ],
         title=MISSION_TITLE,
     )
     if not pad.ok:
         return _abort(nav, f"pad sequence failed: {pad.reason}", results, crossed)
+
+    # The course timeout is a FLIGHT budget, so the clock starts here -- after
+    # the aircraft is airborne. Started before the pad sequence it was consumed
+    # by ground time nobody can bound: reading the banner, typing GO, and the arm
+    # wait, which alone is allowed 300 s. An unhurried pad session could have the
+    # course declared timed out before it had flown a single gate.
+    started_s = time.time()
 
     # ---- 2. one gate at a time, stopping and re-acquiring between each --------
     for gate_index in range(course_cfg.gate_count):
@@ -162,11 +178,18 @@ def run(
         print(f"  GATE {gate_index + 1} OF {course_cfg.gate_count}")
         print("=" * 68)
 
-        outcome = _attempt_gate(nav, mission, leg_cfg, course_cfg, gate_index, results)
+        outcome = _attempt_gate(
+            nav, mission, leg_cfg, course_cfg, gate_index, results, last_crossed_fix
+        )
 
         if outcome.result is GateResult.CROSSED:
             crossed += 1
             consecutive_failures = 0
+            # Remember what we just flew through, so the next leg refuses to fly
+            # it again. Only updated on an actual crossing -- a failed gate was
+            # never passed, so it is still a legitimate target.
+            if outcome.fix is not None:
+                last_crossed_fix = outcome.fix
             # Full stop and settle before looking for the next gate. Phase 2
             # replaces exactly this with a planned transition; keeping it dumb
             # here is the point of having a fallback.
@@ -221,6 +244,7 @@ def _attempt_gate(
     course_cfg: CourseConfig,
     gate_index: int,
     results: List[GateOutcome],
+    avoid_gate=None,
 ) -> GateOutcome:
     """Try one gate, with whole-gate retries on top of gate_leg's own ladder."""
     outcome = None
@@ -228,7 +252,7 @@ def _attempt_gate(
         if attempt:
             print(f"[*] Retrying gate {gate_index} ({attempt}/{course_cfg.gate_retries})")
         outcome = approach_and_cross_one_gate(
-            nav, mission, leg_cfg, gate_index=gate_index
+            nav, mission, leg_cfg, gate_index=gate_index, avoid_gate=avoid_gate
         )
         results.append(outcome)
         if outcome.result in (GateResult.CROSSED, GateResult.ABORTED):
@@ -249,11 +273,13 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     course = parser.add_argument_group("course")
-    course.add_argument("--gates", type=int, default=3, help="number of gates to fly")
+    course.add_argument("--gates", type=int, default=4,
+                        help="number of gates to fly")
     course.add_argument("--gate-retries", type=int, default=1,
                         help="whole-gate retries after gate_leg's own recovery ladder")
     course.add_argument("--max-consecutive-failures", type=int, default=2)
-    course.add_argument("--course-timeout-s", type=float, default=600.0)
+    course.add_argument("--course-timeout-s", type=float, default=480.0,
+                        help="airborne budget, measured from takeoff")
     course.add_argument("--settle-between-gates-s", type=float, default=1.0)
 
     add_common_arguments(parser)
