@@ -12,6 +12,7 @@ sys.modules.setdefault("pymavlink.mavutil", fake_mavutil)
 
 from navigation.navigation import (  # noqa: E402
     GateDetection,
+    LocalTarget,
     VehicleState,
     body_to_local,
     deg_to_rad,
@@ -25,6 +26,7 @@ from navigation.missions.frames import (  # noqa: E402
     evaluate_commit,
     gate_cone_angle_deg,
     lateral_offset_from_axis,
+    limit_approach_step,
     localize_gate,
     pass_through_target,
     resolve_gate_normal,
@@ -445,3 +447,73 @@ class LocalizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApproachStepBudgetTests(unittest.TestCase):
+    """REGRESSION -- first live gate approach, 2026-08-13.
+
+    A single 3-D step cap let the noisiest axis in the system spend the budget
+    that the forward progress needed. Measured in flight: the body-frame `down`
+    reading swung 0.63 m while the gate physically never moved, the commanded
+    altitude bobbed to follow it, and 0.25 m steps delivered only 0.14 m of
+    range closure -- 56% efficient. The leg ran out of attempts at 1.41 m from a
+    gate it needed to reach 1.00 m of.
+    """
+
+    def setUp(self):
+        self.at_origin = VehicleState(n=0.0, e=0.0, d=-1.5)
+
+    def test_vertical_chase_cannot_eat_the_horizontal_budget(self):
+        # 1.0 m ahead and 1.0 m below: a 3-D cap would split the step between
+        # them and deliver ~0.25 m horizontally. Separate budgets deliver the
+        # full horizontal step regardless of what the vertical axis is doing.
+        target = LocalTarget(n=1.0, e=0.0, d=-0.5, yaw_rad=0.0)
+        stepped = limit_approach_step(self.at_origin, target, 0.35, 0.12)
+
+        self.assertAlmostEqual(math.hypot(stepped.n, stepped.e), 0.35, places=9)
+        self.assertAlmostEqual(stepped.d, -1.5 + 0.12, places=9)
+
+    def test_the_flight_geometry_now_yields_a_full_horizontal_step(self):
+        # Observation 5 from the live log: the drone stepped 0.24 m total but
+        # only closed 0.16 m of range because 0.12 m of it went vertical.
+        target = LocalTarget(n=-0.15, e=0.19, d=-1.40, yaw_rad=0.0)
+        current = VehicleState(n=0.0, e=0.0, d=-1.63)
+        stepped = limit_approach_step(current, target, 0.35, 0.12)
+
+        horizontal = math.hypot(stepped.n - current.n, stepped.e - current.e)
+        self.assertAlmostEqual(horizontal, math.hypot(0.15, 0.19), places=9)
+        self.assertLessEqual(abs(stepped.d - current.d), 0.12 + 1e-9)
+
+    def test_a_short_step_is_passed_through_untouched(self):
+        target = LocalTarget(n=0.10, e=0.05, d=-1.55, yaw_rad=0.7)
+        stepped = limit_approach_step(self.at_origin, target, 0.35, 0.12)
+
+        self.assertAlmostEqual(stepped.n, 0.10, places=9)
+        self.assertAlmostEqual(stepped.e, 0.05, places=9)
+        self.assertAlmostEqual(stepped.d, -1.55, places=9)
+
+    def test_the_vertical_cap_is_signed(self):
+        # Climbing and descending are both capped, and neither flips direction.
+        climb = limit_approach_step(
+            self.at_origin, LocalTarget(0.0, 0.0, -3.0, 0.0), 0.35, 0.12
+        )
+        descend = limit_approach_step(
+            self.at_origin, LocalTarget(0.0, 0.0, 0.0, 0.0), 0.35, 0.12
+        )
+        self.assertAlmostEqual(climb.d, -1.62, places=9)
+        self.assertAlmostEqual(descend.d, -1.38, places=9)
+
+    def test_yaw_is_carried_through_unchanged(self):
+        target = LocalTarget(n=9.0, e=9.0, d=0.0, yaw_rad=1.234)
+        self.assertAlmostEqual(
+            limit_approach_step(self.at_origin, target, 0.35, 0.12).yaw_rad,
+            1.234,
+            places=9,
+        )
+
+    def test_non_positive_caps_are_rejected(self):
+        target = LocalTarget(n=1.0, e=0.0, d=-1.5, yaw_rad=0.0)
+        for horizontal, vertical in ((0.0, 0.12), (-1.0, 0.12), (0.35, 0.0)):
+            with self.subTest(horizontal=horizontal, vertical=vertical):
+                with self.assertRaises(ValueError):
+                    limit_approach_step(self.at_origin, target, horizontal, vertical)

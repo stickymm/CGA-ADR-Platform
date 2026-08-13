@@ -1985,6 +1985,7 @@ class GateMission(Mission):
         cam_yaw_offset_deg: float = CAM_YAW_OFFSET_DEG,
         detection_max_age_s: float = 0.5,
         frozen_feed_frames: int = FROZEN_FEED_FRAMES,
+        min_observation_samples: int = 1,
     ):
         self.udp_ip = udp_ip
         self.udp_port = udp_port
@@ -1995,6 +1996,10 @@ class GateMission(Mission):
         # the vision process dying while the last good pose stays latched.
         self.detection_max_age_s = detection_max_age_s
         self.frozen_feed_frames = frozen_feed_frames
+        # Fewest averaged samples that may be reported as a lock. Defaults to 1
+        # so nothing that constructs a GateMission directly changes behaviour;
+        # the missions raise it via the CLI.
+        self.min_observation_samples = max(1, int(min_observation_samples))
 
         self._running = threading.Event()
         self._latest_detection: Optional[GateDetection] = None
@@ -2273,6 +2278,20 @@ class GateMission(Mission):
                 )
             else:
                 print("[!] No valid gate detections seen.")
+            return None
+
+        if len(samples) < self.min_observation_samples:
+            # A thin window is not a lock. In flight one observation averaged a
+            # SINGLE sample and reported a range that disagreed with the
+            # observations either side of it -- a lone PnP solve carrying the
+            # full per-frame error, presented with the same confidence as a
+            # 13-sample average. Treat it as a miss and re-observe; the recovery
+            # ladder already handles a miss, and a wrong fix is worse than none.
+            print(
+                f"[!] Only {len(samples)} valid sample(s) in a {duration:.2f}s window "
+                f"(need {self.min_observation_samples}). Too thin to average -- "
+                f"discarding rather than acting on one raw solve."
+            )
             return None
 
         avg = average_detections(samples)

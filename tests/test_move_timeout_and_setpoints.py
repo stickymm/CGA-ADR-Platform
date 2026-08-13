@@ -129,6 +129,62 @@ class MoveTimeoutTests(unittest.TestCase):
                     estimate_move_timeout(distance, speed)
 
 
+class ApproachBudgetAfterFirstFlightTests(unittest.TestCase):
+    """The retuned approach defaults, checked against the flight that failed.
+
+    First live gate approach, 2026-08-13. The aircraft flew well and tracked the
+    gate cleanly; it simply ran out of attempts, reaching 1.41 m of a gate it
+    needed to be within 1.00 m of, on attempt 14 of 14, still closing.
+    """
+
+    OBSERVED_START_RANGE_M = 3.23
+    OBSERVED_CLOSURE_PER_STEP_M = 0.14   # 0.25 m steps, 56% efficient
+
+    def setUp(self):
+        from navigation.missions.contracts import GateLegConfig
+
+        self.cfg = GateLegConfig()
+
+    def test_the_old_defaults_could_not_have_reached_the_gate(self):
+        # The defect, preserved as arithmetic so nobody quietly reverts it.
+        needed_m = self.OBSERVED_START_RANGE_M - 1.00
+        attempts_required = needed_m / self.OBSERVED_CLOSURE_PER_STEP_M
+
+        self.assertGreater(attempts_required, 14)
+
+    def test_the_new_attempt_cap_covers_that_approach_even_at_the_old_efficiency(self):
+        # Worst case: assume the separate vertical budget buys nothing at all
+        # and every step still yields only the observed 0.14 m.
+        needed_m = self.OBSERVED_START_RANGE_M - self.cfg.commit_distance_m
+        attempts_required = needed_m / self.OBSERVED_CLOSURE_PER_STEP_M
+
+        self.assertLessEqual(attempts_required, self.cfg.max_approach_attempts)
+
+    def test_the_deadline_can_still_deliver_the_attempts_it_advertises(self):
+        from navigation.missions.contracts import attempt_budget_s, deadline_consistency
+
+        self.assertLessEqual(attempt_budget_s(self.cfg), self.cfg.approach_timeout_s)
+        self.assertEqual(deadline_consistency(self.cfg), ())
+
+    def test_the_arrival_tolerance_is_still_smaller_than_the_bigger_step(self):
+        # Raising step_size_m must not let a step "arrive" without moving.
+        self.assertLess(self.cfg.arrival_tolerance_m, self.cfg.step_size_m)
+
+    def test_the_vertical_budget_stays_well_under_the_horizontal_one(self):
+        # The whole point is that the noisy axis cannot dominate the step.
+        self.assertLess(self.cfg.vertical_step_m, self.cfg.step_size_m / 2.0)
+
+    def test_the_commit_tolerances_were_NOT_loosened(self):
+        # The gate is a 0.97155 m square. With a ~0.4 m airframe there is only
+        # ~0.29 m of true clearance per side, so 0.20 / 0.25 m is already at the
+        # limit. Making the approach easier must never come from making the
+        # decision to fly at a gate easier.
+        self.assertAlmostEqual(self.cfg.commit_lateral_tol_m, 0.20, places=9)
+        self.assertAlmostEqual(self.cfg.commit_vertical_tol_m, 0.25, places=9)
+        self.assertAlmostEqual(self.cfg.commit_distance_m, 1.00, places=9)
+        self.assertEqual(self.cfg.commit_confirm_frames, 3)
+
+
 class TypeMaskTests(unittest.TestCase):
     def test_velocity_and_yaw_mask_is_the_documented_value(self):
         # ignore x(1) y(2) z(4) + ax(64) ay(128) az(256) + yaw_rate(2048) = 2503

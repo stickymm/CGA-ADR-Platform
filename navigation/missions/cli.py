@@ -83,10 +83,32 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     gate.add_argument("--commit-vertical-tol-m", type=float, default=0.25)
     gate.add_argument("--commit-max-cone-deg", type=float, default=60.0)
     gate.add_argument("--commit-confirm-frames", type=int, default=3)
-    gate.add_argument("--step-size-m", type=float, default=0.25)
+    gate.add_argument(
+        "--step-size-m",
+        type=float,
+        default=0.35,
+        help="HORIZONTAL displacement cap for one approach step. Raised from "
+             "0.25 after the first live approach ran out of attempts",
+    )
+    gate.add_argument(
+        "--vertical-step-m",
+        type=float,
+        default=0.12,
+        help="vertical displacement cap for one approach step, budgeted "
+             "separately so noisy gate-height estimates cannot eat the forward "
+             "progress",
+    )
+    gate.add_argument(
+        "--min-observation-samples",
+        type=int,
+        default=3,
+        help="fewest averaged detections that may be called a lock; a thinner "
+             "window is treated as a miss rather than acted on",
+    )
     gate.add_argument("--pass-distance-m", type=float, default=1.5)
     gate.add_argument("--exit-clearance-m", type=float, default=0.8)
-    gate.add_argument("--observation-duration-s", type=float, default=0.5)
+    gate.add_argument("--observation-duration-s", type=float, default=0.8,
+                  help="sampling window per observation. 0.5 s produced as few as ONE usable sample in flight")
     gate.add_argument("--max-detection-age-s", type=float, default=0.4)
     gate.add_argument(
         "--arrival-tolerance-m",
@@ -104,8 +126,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     limits = parser.add_argument_group("limits and recovery")
-    limits.add_argument("--max-approach-attempts", type=int, default=14)
-    limits.add_argument("--approach-timeout-s", type=float, default=90.0)
+    limits.add_argument("--max-approach-attempts", type=int, default=24)
+    limits.add_argument("--approach-timeout-s", type=float, default=150.0)
     limits.add_argument(
         "--max-yaw-rate-deg-s",
         type=float,
@@ -196,6 +218,8 @@ def build_leg_config(args, envelope: AltitudeEnvelope) -> GateLegConfig:
         max_backoffs=args.max_backoffs,
         max_detection_age_s=args.max_detection_age_s,
         arrival_tolerance_m=args.arrival_tolerance_m,
+        vertical_step_m=args.vertical_step_m,
+        min_observation_samples=args.min_observation_samples,
         altitude=envelope,
     )
 
@@ -230,6 +254,7 @@ def build_mission(args) -> DetectionOnlyMission:
         cam_yaw_offset_deg=args.camera_yaw_offset_deg,
         detection_max_age_s=args.max_detection_age_s,
         frozen_feed_frames=args.frozen_feed_frames,
+        min_observation_samples=args.min_observation_samples,
     )
 
 

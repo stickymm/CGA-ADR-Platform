@@ -438,6 +438,61 @@ class ObserveGateSetpointTests(unittest.TestCase):
             self.assertIsNone(mission.observe_gate(nav, duration=0.5))
 
 
+class ThinObservationTests(unittest.TestCase):
+    """REGRESSION -- first live gate approach, 2026-08-13.
+
+    One observation window reported `Lock acquired from 1 samples` and produced
+    a range that disagreed with the observations either side of it. A single raw
+    PnP solve carries the full per-frame error and was being presented with
+    exactly the same confidence as a 13-sample average.
+    """
+
+    def _observe(self, mission, samples_available):
+        nav = FakeNav()
+        clock = FakeClock()
+        remaining = [samples_available]
+
+        def snapshot():
+            if remaining[0] <= 0:
+                return None
+            remaining[0] -= 1
+            return detection(timestamp=clock.time())
+
+        with patch.object(nav_module, "time", clock), \
+             patch.object(mission, "get_latest_detection_snapshot", snapshot):
+            return mission.observe_gate(nav, duration=0.8)
+
+    def test_a_single_sample_is_not_a_lock(self):
+        mission = GateMission(min_observation_samples=3)
+        with patch("builtins.print") as printed:
+            result = self._observe(mission, samples_available=1)
+
+        self.assertIsNone(result)
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("Only 1 valid sample", output)
+        self.assertIn("Too thin to average", output)
+
+    def test_enough_samples_still_produce_a_lock(self):
+        mission = GateMission(min_observation_samples=3)
+        self.assertIsNotNone(self._observe(mission, samples_available=12))
+
+    def test_the_boundary_is_inclusive(self):
+        mission = GateMission(min_observation_samples=3)
+        self.assertIsNone(self._observe(mission, samples_available=2))
+        self.assertIsNotNone(self._observe(GateMission(min_observation_samples=3), 3))
+
+    def test_the_default_preserves_the_old_behaviour(self):
+        # Anything constructing a GateMission directly must be unaffected.
+        self.assertEqual(GateMission().min_observation_samples, 1)
+        self.assertIsNotNone(self._observe(GateMission(), samples_available=1))
+
+    def test_a_thin_window_is_a_miss_not_a_crash(self):
+        # gate_leg treats None as "not seen" and runs the recovery ladder, which
+        # is exactly the intended handling -- a wrong fix is worse than none.
+        mission = GateMission(min_observation_samples=5)
+        self.assertIsNone(self._observe(mission, samples_available=4))
+
+
 class FrozenFeedTests(unittest.TestCase):
     """PROJECT_STATE gap 1 -- the third staleness signal."""
 

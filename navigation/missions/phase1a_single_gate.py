@@ -76,8 +76,6 @@ def _abort(nav, reason: str) -> int:
 def run(nav, mission, leg_cfg: GateLegConfig, pad_cfg: PadConfig, mission_deadline_s: float) -> int:
     """The whole mission, in order.  Returns a process exit code."""
 
-    started_s = time.time()
-
     # ---- 1. pad sequence: link, telemetry, vision, stream, confirm, arm, climb
     pad = run_pad_sequence(
         nav,
@@ -89,13 +87,25 @@ def run(nav, mission, leg_cfg: GateLegConfig, pad_cfg: PadConfig, mission_deadli
     if not pad.ok:
         return _abort(nav, f"pad sequence failed: {pad.reason}")
 
+    # The deadline is a FLIGHT budget, so the clock starts here -- after the
+    # aircraft is airborne -- not when the process started. Started earlier, it
+    # was consumed by ground time nobody can bound: reading the banner, typing
+    # GO, and the arm wait, which alone is allowed 300 s. An operator who took
+    # their time on the pad could have the gate leg aborted on arrival for
+    # "exceeding" a budget it had never been given any of.
+    started_s = time.time()
+
     # ---- 2. approach, align, commit, cross -- one call, six named outcomes ---
     print("\n[STEP 8] Approaching the gate")
     outcome = approach_and_cross_one_gate(nav, mission, leg_cfg, gate_index=0)
 
     elapsed = time.time() - started_s
     if elapsed > mission_deadline_s:
-        return _abort(nav, f"mission deadline of {mission_deadline_s:.0f}s exceeded")
+        return _abort(
+            nav,
+            f"flight deadline of {mission_deadline_s:.0f}s exceeded "
+            f"({elapsed:.0f}s airborne)",
+        )
 
     if outcome.result is not GateResult.CROSSED:
         return _abort(nav, f"gate not crossed ({outcome.result.value}): {outcome.reason}")
@@ -108,7 +118,7 @@ def run(nav, mission, leg_cfg: GateLegConfig, pad_cfg: PadConfig, mission_deadli
     print("\n" + "=" * 62)
     print(f"[RESULT] gate 0: {outcome.result.value}")
     print(f"         attempts={outcome.attempts} reacquires={outcome.reacquires} "
-          f"gate time={outcome.elapsed_s:.1f}s mission time={elapsed:.1f}s")
+          f"gate time={outcome.elapsed_s:.1f}s flight time={elapsed:.1f}s")
     if outcome.fix is not None:
         fix = outcome.fix
         print(f"         last fix: N={fix.n:+.2f} E={fix.e:+.2f} D={fix.d:+.2f} "
@@ -124,7 +134,10 @@ def parse_args(argv=None):
         description="Phase 1A: take off, cross one gate, land.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--mission-timeout-s", type=float, default=180.0)
+    # Airborne budget only -- the clock starts after takeoff, not at launch,
+    # so ground time is not charged against it. Sized to cover the gate leg
+    # deadline (150 s) plus the crossing and a landing.
+    parser.add_argument("--mission-timeout-s", type=float, default=240.0)
     add_common_arguments(parser)
     return parser.parse_args(argv)
 

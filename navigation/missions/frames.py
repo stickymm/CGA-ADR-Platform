@@ -417,6 +417,63 @@ def standoff_target(fix: GateFix, standoff_m: float, envelope: AltitudeEnvelope)
     )
 
 
+def limit_approach_step(
+    current: VehicleState,
+    target: LocalTarget,
+    max_horizontal_m: float,
+    max_vertical_m: float,
+) -> LocalTarget:
+    """Cap one approach step, budgeting horizontal and vertical SEPARATELY.
+
+    WHY THIS EXISTS RATHER THAN ``limit_target_step``
+        ``limit_target_step`` caps the **3-D** displacement.  That is correct for
+        a move whose axes are equally trustworthy -- and wrong for an approach,
+        because on this airframe they are not remotely equal.
+
+        Measured in flight (2026-08-13, first live gate approach): the
+        body-frame ``down`` reading swung across 0.63 m -- from -0.06 m to
+        +0.57 m -- while the gate physically never moved.  The commanded
+        altitude bobbed between D = -1.16 and -1.52 chasing that noise.  With a
+        single 3-D cap, every centimetre of that vertical chase came straight
+        out of the forward budget: 0.25 m steps delivered only 0.14 m of range
+        closure, 56% efficiency, and the leg ran out of attempts at 1.41 m from
+        a gate it needed to reach 1.00 m of.
+
+        Splitting the budget makes the horizontal step immune to vertical noise.
+        The vertical cap should be small: altitude error is real but it is not
+        urgent, it corrects a little on every attempt, and the commit gate
+        measures it directly at the end anyway.
+
+    Both caps are applied independently, so the total 3-D displacement may reach
+    ``hypot(max_horizontal_m, max_vertical_m)``.  That is intended -- it is the
+    horizontal *progress* that is being protected, not the vector magnitude.
+    """
+    if max_horizontal_m <= 0.0:
+        raise ValueError("max_horizontal_m must be positive")
+    if max_vertical_m <= 0.0:
+        raise ValueError("max_vertical_m must be positive")
+
+    delta_n = target.n - current.n
+    delta_e = target.e - current.e
+    delta_d = target.d - current.d
+
+    horizontal = math.hypot(delta_n, delta_e)
+    if horizontal > max_horizontal_m:
+        scale = max_horizontal_m / horizontal
+        delta_n *= scale
+        delta_e *= scale
+
+    if abs(delta_d) > max_vertical_m:
+        delta_d = math.copysign(max_vertical_m, delta_d)
+
+    return LocalTarget(
+        n=current.n + delta_n,
+        e=current.e + delta_e,
+        d=current.d + delta_d,
+        yaw_rad=target.yaw_rad,
+    )
+
+
 def pass_through_target(fix: GateFix, pass_dist_m: float, envelope: AltitudeEnvelope) -> LocalTarget:
     """A point ``pass_dist_m`` beyond the gate, along the direction of travel."""
     if pass_dist_m <= 0.0:

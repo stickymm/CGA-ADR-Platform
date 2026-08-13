@@ -143,15 +143,44 @@ class GateLegConfig:
     """
 
     # --- approach ---
+    #
+    # RETUNED 2026-08-13 after the first live gate approach. The aircraft flew
+    # well, tracked the gate cleanly (lateral down to +/-0.10 m, cone under 3
+    # degrees) and simply ran out of attempts: it reached 1.41 m of a gate it
+    # needed to be within 1.00 m of, on attempt 14 of 14, still closing.
+    #
+    # The arithmetic from that flight:
+    #     started at   3.23 m, needed  <= 1.00 m  ->  2.23 m to close
+    #     delivered    0.14 m of range closure per 0.25 m step  (56% efficient)
+    #     therefore    ~16 attempts required, 14 available
+    #
+    # Three numbers move as a result, and they are coupled: a bigger step and a
+    # separate vertical budget raise the per-attempt yield, and a higher attempt
+    # cap covers what is left. The deadline moves with them so the advertised
+    # attempt count stays reachable -- see attempt_budget_s() below.
     commit_distance_m: float = 1.0
-    step_size_m: float = 0.25
+    step_size_m: float = 0.35
     approach_speed_m_s: float = 0.35
-    observation_duration_s: float = 0.5
-    max_approach_attempts: int = 14
-    # 90 s, not 75 s -- see attempt_budget_s() below and the MOVE_TIMEOUT note in
-    # navigation.py. 75 s could not actually deliver the 14 attempts this config
-    # advertises; the numbers now agree with each other by construction.
-    approach_timeout_s: float = 90.0
+    # 0.8 s, not 0.5 s. The 0.5 s window produced as few as ONE usable sample in
+    # flight, and a one-sample average is not an average -- see
+    # min_observation_samples.
+    observation_duration_s: float = 0.8
+    max_approach_attempts: int = 24
+    approach_timeout_s: float = 150.0
+
+    # Vertical budget for one approach step, spent independently of the
+    # horizontal one. Deliberately small: the gate's measured height is the
+    # noisiest quantity in the whole pipeline (0.63 m of swing observed in
+    # flight), altitude error is not urgent, and it corrects a little on every
+    # attempt. Capping it here is what stops that noise consuming the forward
+    # progress -- see frames.limit_approach_step.
+    vertical_step_m: float = 0.12
+
+    # Fewest averaged detections that may be called a "lock". In flight one
+    # observation window produced a single sample and reported a range that
+    # disagreed with the observations either side of it. One raw PnP solve is
+    # not a measurement; treat a thin window as a miss and re-observe.
+    min_observation_samples: int = 3
 
     # Arrival tolerance for the approach steps of this leg.  Separate from the
     # commit tolerances on purpose: this one asks "did the vehicle finish the
@@ -213,9 +242,13 @@ class GateLegConfig:
             "max_telemetry_age_s": self.max_telemetry_age_s,
         }
         positive["arrival_tolerance_m"] = self.arrival_tolerance_m
+        positive["vertical_step_m"] = self.vertical_step_m
         for name, value in positive.items():
             if not value > 0.0:
                 raise ValueError(f"{name} must be positive, got {value!r}")
+
+        if self.min_observation_samples < 1:
+            raise ValueError("min_observation_samples must be at least 1")
 
         # An arrival tolerance at or above the step size makes every approach
         # step arrive before it moves, so the drone would "approach" the gate by
@@ -318,8 +351,10 @@ def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
         ("commit vertical tol", f"{cfg.commit_vertical_tol_m:.2f} m"),
         ("commit max cone", f"{cfg.commit_max_cone_deg:.1f} deg"),
         ("commit confirm frames", f"{cfg.commit_confirm_frames}"),
-        ("approach step", f"{cfg.step_size_m:.2f} m"),
+        ("approach step", f"{cfg.step_size_m:.2f} m horizontal, "
+                          f"{cfg.vertical_step_m:.2f} m vertical"),
         ("arrival tolerance", f"{cfg.arrival_tolerance_m:.2f} m"),
+        ("min samples per lock", f"{cfg.min_observation_samples}"),
         ("approach speed", f"{cfg.approach_speed_m_s:.2f} m/s"),
         ("cross speed", f"{cfg.cross_speed_m_s:.2f} m/s"),
         ("pass distance", f"{cfg.pass_distance_m:.2f} m"),

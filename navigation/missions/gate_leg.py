@@ -48,11 +48,11 @@ from .frames import (
     backoff_target,
     crossed_gate_plane,
     evaluate_commit,
+    limit_approach_step,
     localize_gate,
     pass_through_target,
     standoff_target,
 )
-from .single_gate import limit_target_step
 
 LogFn = Callable[[str], None]
 
@@ -297,7 +297,13 @@ def approach_and_cross_one_gate(
             label = f"gate {gate_index} standoff {standoff_m:.2f}m"
 
         desired = standoff_target(fix, standoff_m, envelope)
-        stepped = limit_target_step(state, desired, cfg.step_size_m)
+        # Horizontal and vertical budgets are spent separately. A single 3-D cap
+        # let the noisy gate-height estimate eat the forward progress -- 0.25 m
+        # steps delivered 0.14 m of range closure in flight. See
+        # frames.limit_approach_step.
+        stepped = limit_approach_step(
+            state, desired, cfg.step_size_m, cfg.vertical_step_m
+        )
         if not nav.move_to_target(
             stepped,
             label,
