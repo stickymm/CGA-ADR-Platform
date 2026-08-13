@@ -14,6 +14,7 @@ from ..navigation import (
     CAM_OFFSET_DOWN_M,
     CAM_OFFSET_RIGHT_M,
     CAM_YAW_OFFSET_DEG,
+    GATE_AIM_BIAS_DOWN_M,
     MAVLINK_CONN,
     GateMission,
     NavigationController,
@@ -155,9 +156,22 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
     hardware = parser.add_argument_group("hardware")
     hardware.add_argument("--mavlink", default=MAVLINK_CONN)
-    hardware.add_argument("--camera-right-offset-m", type=float, default=CAM_OFFSET_RIGHT_M)
-    hardware.add_argument("--camera-down-offset-m", type=float, default=CAM_OFFSET_DOWN_M)
-    hardware.add_argument("--camera-yaw-offset-deg", type=float, default=CAM_YAW_OFFSET_DEG)
+    hardware.add_argument("--camera-down-offset-m", type=float,
+                          default=CAM_OFFSET_DOWN_M,
+                          help="+ve = camera mounted BELOW the vehicle reference; flies the drone LOWER")
+    hardware.add_argument("--camera-right-offset-m", type=float,
+                          default=CAM_OFFSET_RIGHT_M,
+                          help="+ve = camera mounted LEFT of the vehicle reference")
+    hardware.add_argument("--camera-yaw-offset-deg", type=float,
+                          default=CAM_YAW_OFFSET_DEG,
+                          help="+ve = camera aims LEFT of the nose")
+    hardware.add_argument(
+        "--aim-bias-down-m",
+        type=float,
+        default=GATE_AIM_BIAS_DOWN_M,
+        help="deliberate downward aim bias inside the gate opening, for "
+             "propeller/battery clearance. NOT the camera mount offset -- that is --camera-down-offset-m",
+    )
 
     checks = parser.add_argument_group("pre-flight checks")
     checks.add_argument("--allow-no-detections", action="store_true",
@@ -197,6 +211,7 @@ def resolve_offline_camera_offsets(args) -> None:
     args.camera_right_offset_m = 0.0
     args.camera_down_offset_m = 0.0
     args.camera_yaw_offset_deg = 0.0
+    args.aim_bias_down_m = 0.0
 
 
 def build_envelope(args) -> AltitudeEnvelope:
@@ -265,6 +280,7 @@ def build_mission(args) -> DetectionOnlyMission:
         cam_offset_right_m=args.camera_right_offset_m,
         cam_offset_down_m=args.camera_down_offset_m,
         cam_yaw_offset_deg=args.camera_yaw_offset_deg,
+        aim_bias_down_m=args.aim_bias_down_m,
         detection_max_age_s=args.max_detection_age_s,
         frozen_feed_frames=args.frozen_feed_frames,
         min_observation_samples=args.min_observation_samples,

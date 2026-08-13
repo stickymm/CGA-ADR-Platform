@@ -294,7 +294,17 @@ def run_pad_sequence(
     )
     nav.altitude_envelope = envelope
 
+    # The camera geometry is applied to EVERY detection and was invisible in
+    # the banner for the first three flights, one of which flew 0.20 m high
+    # because of an inverted sign here. If it changes where the aircraft
+    # goes, the operator reads it before arming.
     rows = list(banner_rows) + [
+        ("camera down offset", f"{getattr(mission, 'cam_offset_down_m', 0.0):+.2f} m "
+                               f"(+ve = camera BELOW reference, flies lower)"),
+        ("camera right offset", f"{getattr(mission, 'cam_offset_right_m', 0.0):+.2f} m"),
+        ("camera yaw offset", f"{getattr(mission, 'cam_yaw_offset_deg', 0.0):+.1f} deg"),
+        ("gate aim bias", f"{getattr(mission, 'aim_bias_down_m', 0.0):+.2f} m down "
+                          f"(prop/battery clearance)"),
         ("pad reference d", f"{state.d:+.2f} m (NED)"),
         ("dry run", "YES -- nothing will be transmitted" if nav.dry_run else "no"),
     ]

@@ -74,6 +74,7 @@ class NavigationGeometryTests(unittest.TestCase):
             cam_offset_right_m=0.0,
             cam_offset_down_m=0.0,
             cam_yaw_offset_deg=0.0,
+            aim_bias_down_m=0.0,   # this test is about the MOUNT offsets
         )
         state = VehicleState(yaw_rad=0.0)
         gate = GateDetection(

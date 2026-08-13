@@ -449,6 +449,69 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CameraGeometryTests(unittest.TestCase):
+    """REGRESSION -- the down offset's sign was inverted for three flights.
+
+    The camera is bolted BELOW the flight controller, whose position is what
+    LOCAL_POSITION_NED reports and what every setpoint moves. A correctly
+    centred vehicle therefore sees the gate ABOVE the camera, so the offset that
+    zeroes `vertical_body_m` is POSITIVE. It was -0.10.
+
+    Flight of 2026-08-13, observation 7: the camera measured the gate 0.03 m
+    BELOW itself; the code concluded it was 0.07 m ABOVE; the aircraft flew at
+    the top of the gate. Net error ~0.20 m, upward, on every single approach.
+    """
+
+    ENVELOPE = AltitudeEnvelope(d_takeoff=0.0)
+
+    def _fix(self, **kwargs):
+        det = detection(forward=3.0, right=0.0, down=0.03, dist=3.0)
+        state = VehicleState(n=0.0, e=0.0, d=-1.5, yaw_rad=0.0)
+        return localize_gate(det, state, self.ENVELOPE, **kwargs)
+
+    def test_a_camera_below_the_reference_flies_the_drone_lower(self):
+        # Positive offset => the gate is understood to be lower => descend.
+        high = self._fix(cam_offset_down_m=-0.10)
+        correct = self._fix(cam_offset_down_m=+0.10)
+
+        self.assertLess(high.d, correct.d)          # d is DOWN: less is higher
+        self.assertAlmostEqual(correct.d - high.d, 0.20, places=6)
+
+    def test_the_flight_numbers_reproduce_exactly(self):
+        # raw down +0.03 with the old -0.10 offset read as 0.07 m ABOVE.
+        self.assertAlmostEqual(
+            self._fix(cam_offset_down_m=-0.10).vertical_body_m, -0.07, places=6
+        )
+        # With the sign corrected it reads as 0.13 m BELOW, which is the truth
+        # for a camera 0.10 m under the reference.
+        self.assertAlmostEqual(
+            self._fix(cam_offset_down_m=+0.10).vertical_body_m, +0.13, places=6
+        )
+
+    def test_the_aim_bias_is_separate_from_the_mount_offset(self):
+        # Same physical mounting, different deliberate aim point. They add.
+        mount_only = self._fix(cam_offset_down_m=0.10, aim_bias_down_m=0.0)
+        with_bias = self._fix(cam_offset_down_m=0.10, aim_bias_down_m=0.05)
+
+        self.assertAlmostEqual(with_bias.d - mount_only.d, 0.05, places=6)
+        self.assertAlmostEqual(
+            with_bias.vertical_body_m - mount_only.vertical_body_m, 0.05, places=6
+        )
+
+    def test_the_aim_bias_moves_the_commit_target_and_the_commit_test_together(self):
+        # If only the target were biased, the commit gate would demand centring
+        # on a point the approach was deliberately steering away from, and the
+        # two would fight. They must shift by the same amount.
+        biased = self._fix(cam_offset_down_m=0.10, aim_bias_down_m=0.05)
+        target = standoff_target(biased, 1.0, self.ENVELOPE)
+
+        self.assertAlmostEqual(target.d, biased.d, places=9)
+
+    def test_zero_offsets_leave_the_detection_untouched(self):
+        fix = self._fix(cam_offset_down_m=0.0, aim_bias_down_m=0.0)
+        self.assertAlmostEqual(fix.vertical_body_m, 0.03, places=9)
+
+
 class ApproachStepBudgetTests(unittest.TestCase):
     """REGRESSION -- first live gate approach, 2026-08-13.
 

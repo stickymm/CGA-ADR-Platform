@@ -540,7 +540,12 @@ class AbortAndDeadlineTests(unittest.TestCase):
         )
 
         self.assertIs(outcome.result, GateResult.ABORTED)
-        self.assertIn("no longer in OFFBOARD", outcome.reason)
+        self.assertIn("left OFFBOARD", outcome.reason)
+        # The likeliest cause on a supervised flight is named FIRST -- the
+        # old message went straight to "offboard/link problem", which was
+        # the rarest of the three and sent the operator down the wrong path.
+        self.assertIn("safety pilot took control", outcome.reason)
+        self.assertIn("COM_RC_OVERRIDE", outcome.reason)
         self.assertIn("suspect optical flow", outcome.reason)
 
     def test_the_gate_deadline_is_enforced(self):

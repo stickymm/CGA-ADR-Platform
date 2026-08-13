@@ -150,14 +150,25 @@ def approach_and_cross_one_gate(
                 + nav.estimator_note(),
             )
         if not nav.get_vehicle_snapshot().in_offboard:
-            # PX4 sets `offboard_control_signal_lost` when the ESTIMATOR fails
-            # its velocity innovation check past COM_VEL_FS_EVH, so the obvious
-            # reading of this message -- "the companion link dropped" -- is
-            # wrong about as often as it is right on a flow-only airframe.
-            # estimator_note() says which one it actually was.
+            # Three quite different things put PX4 here, and the log used to name
+            # only the least likely of them. In descending order of probability
+            # on a supervised test flight:
+            #
+            #   1. The safety pilot took control -- a mode switch, or simply
+            #      touching the sticks with COM_RC_OVERRIDE enabled. Nothing is
+            #      wrong; a human decided. Observed 2026-08-13 at 0.92 m, one
+            #      frame after the commit gate first passed.
+            #   2. The ESTIMATOR failed its velocity innovation check past
+            #      COM_VEL_FS_EVH. PX4 reports that as offboard signal loss even
+            #      though the real cause is flow degradation -- which is what
+            #      estimator_note() exists to distinguish.
+            #   3. An actual offboard/link problem. Rarest, and the only one the
+            #      old message ever suggested.
             return finish(
                 GateResult.ABORTED,
-                "PX4 is no longer in OFFBOARD" + nav.estimator_note(),
+                "PX4 left OFFBOARD -- most likely the safety pilot took control "
+                "(mode switch, or stick input with COM_RC_OVERRIDE enabled); "
+                "otherwise estimator or link" + nav.estimator_note(),
             )
         if attempts >= cfg.max_approach_attempts:
             return finish(
@@ -248,6 +259,7 @@ def approach_and_cross_one_gate(
             cam_offset_right_m=mission.cam_offset_right_m,
             cam_offset_down_m=mission.cam_offset_down_m,
             cam_yaw_offset_deg=mission.cam_yaw_offset_deg,
+            aim_bias_down_m=getattr(mission, "aim_bias_down_m", 0.0),
             max_cone_deg=cfg.commit_max_cone_deg,
         )
 

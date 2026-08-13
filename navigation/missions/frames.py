@@ -241,6 +241,7 @@ def localize_gate(
     cam_offset_right_m: float = 0.0,
     cam_offset_down_m: float = 0.0,
     cam_yaw_offset_deg: float = 0.0,
+    aim_bias_down_m: float = 0.0,
     max_cone_deg: float = 60.0,
 ) -> GateFix:
     """Turn one body-relative detection into a local-NED :class:`GateFix`.
@@ -255,11 +256,30 @@ def localize_gate(
     two disagree -- most of all while moving, which is exactly when the commit
     decision is made.  ``det.dist`` is used only as the no-detection sentinel.
 
-    Camera offsets are added to the detection before the rotation, so a positive
-    ``cam_offset_down_m`` makes the gate appear lower and flies the drone down.
+    TWO VERTICAL CORRECTIONS, AND THEY MEAN DIFFERENT THINGS
+        ``cam_offset_down_m`` is a physical fact: how far the camera is mounted
+        below the vehicle reference point.  Positive means below, which makes
+        the gate appear lower and flies the drone down.  See the derivation on
+        ``CAM_OFFSET_DOWN_M`` in ``navigation.py`` -- its sign was inverted for
+        the first three flights and cost ~0.20 m of altitude on every approach.
+
+        ``aim_bias_down_m`` is a deliberate choice: where inside the gate
+        opening to fly.  Positive aims lower, buying clearance for propellers
+        and battery, which sit above the reference point and are the parts you
+        least want to touch a gate leg.
+
+        Both land on the same axis, so both are folded in here rather than at
+        the target-building step.  That keeps the commit decision and the flown
+        target measuring the same thing -- if only the target were biased, the
+        commit gate would be demanding the vehicle centre on a point the
+        approach was deliberately steering away from.
+
+        CONSEQUENCE: ``GateFix.d`` and ``vertical_body_m`` describe the AIM
+        POINT, not the geometric gate centre.  With a zero bias they are the
+        same thing, which is the default everywhere except a real flight.
     """
     corrected_right = det.right + cam_offset_right_m
-    corrected_down = det.down + cam_offset_down_m
+    corrected_down = det.down + cam_offset_down_m + aim_bias_down_m
 
     dn, de, dd = rotate_body_to_ned(
         det.forward,
@@ -319,6 +339,7 @@ def localize_gates(
     cam_offset_right_m: float = 0.0,
     cam_offset_down_m: float = 0.0,
     cam_yaw_offset_deg: float = 0.0,
+    aim_bias_down_m: float = 0.0,
     max_cone_deg: float = 60.0,
 ) -> Tuple[GateFix, ...]:
     """Localize **every** gate in one vision packet, not just the nearest.
@@ -342,6 +363,7 @@ def localize_gates(
             cam_offset_right_m=cam_offset_right_m,
             cam_offset_down_m=cam_offset_down_m,
             cam_yaw_offset_deg=cam_yaw_offset_deg,
+            aim_bias_down_m=aim_bias_down_m,
             max_cone_deg=max_cone_deg,
         )
         for det in detections

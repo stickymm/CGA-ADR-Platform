@@ -75,14 +75,53 @@ KP_POS = 1.2
 MAX_YAW_RATE_DEG_S = 45.0
 
 # --- HARDWARE OFFSETS ---
-# Sign conventions, recovered from the abandoned navigation_closed_loop.py
-# prototype, which was the only surviving record of what these mean.  Each
-# offset is added to the raw detection before the body->NED rotation, so a
-# positive value makes the gate appear further right/down/clockwise and
-# therefore flies the drone right/down/clockwise to match.
-CAM_OFFSET_RIGHT_M = -0.25   # Negative = shift drone Left | Positive = shift drone Right
-CAM_OFFSET_DOWN_M = -0.10    # Negative = shift drone Up   | Positive = shift drone Down
-CAM_YAW_OFFSET_DEG = -10.0   # Negative = Yaw Left | Positive = Yaw Right
+#
+# Each offset is added to the raw detection before the body->NED rotation, so it
+# answers one question: "where is the vehicle reference point, relative to what
+# the camera is looking at?"
+#
+# DERIVATION FOR THE DOWN OFFSET, because its sign was wrong for the whole of
+# the first three flights and cost roughly 0.20 m of altitude every time.
+#
+#   The camera is bolted BELOW the flight controller, whose position is what
+#   LOCAL_POSITION_NED reports and therefore what every setpoint moves.  Call
+#   that vertical separation h.
+#
+#   Let H be height above ground.  The camera reports `down`, positive when the
+#   gate is BELOW it:            down = H_cam - H_gate
+#   The camera is h below the reference:   H_cam = H_ref - h
+#   When the vehicle is correctly centred, H_ref == H_gate, so:
+#                                down = (H_gate - h) - H_gate = -h
+#
+#   i.e. a correctly-centred vehicle sees the gate ABOVE the camera by h.  For
+#   `vertical_body_m = down + CAM_OFFSET_DOWN_M` to read zero there:
+#
+#                          CAM_OFFSET_DOWN_M = +h        (POSITIVE)
+#
+#   It was -0.10.  Flight of 2026-08-13: the camera measured the gate 0.03 m
+#   BELOW itself, the code concluded it was 0.07 m ABOVE, and the aircraft flew
+#   at the top of the gate.  Positive = camera below the reference = fly lower.
+#
+# MEASURE THESE. They are not derivable from anything and the previous values
+# were inherited from an abandoned prototype file. Tape measure, on the bench,
+# against the numbers STEP 3 prints.
+CAM_OFFSET_RIGHT_M = 0.0     # +ve = camera mounted LEFT of the reference (flies drone right)
+CAM_OFFSET_DOWN_M = 0.10     # +ve = camera mounted BELOW the reference (flies drone lower)
+CAM_YAW_OFFSET_DEG = 0.0     # +ve = camera aims LEFT of the nose (yaws drone right)
+
+# Deliberate vertical bias of the aim point INSIDE the gate opening.  Distinct
+# from the mount offset above, which is a physical fact about where the camera
+# is: this is a safety choice about where in the hole to fly.
+#
+# The airframe is vertically asymmetric about the flight controller -- camera
+# and legs below, battery and propellers above -- and the propellers are both
+# the most fragile part and the highest.  Aiming a little low trades clearance
+# the bottom of the frame does not need for clearance the props do.
+#
+# Small on purpose.  The gate is a 0.97 m square, so the centre is ~0.49 m from
+# either edge; this is a nudge, not a strategy, and it must stay well inside
+# commit_vertical_tol_m or the commit gate and the aim point start disagreeing.
+GATE_AIM_BIAS_DOWN_M = 0.05
 
 NO_DETECTION_DIST = 999.0
 # The vision process pads absent gates with an all-999.0 row.  Comparing floats
@@ -1983,6 +2022,7 @@ class GateMission(Mission):
         cam_offset_right_m: float = CAM_OFFSET_RIGHT_M,
         cam_offset_down_m: float = CAM_OFFSET_DOWN_M,
         cam_yaw_offset_deg: float = CAM_YAW_OFFSET_DEG,
+        aim_bias_down_m: float = GATE_AIM_BIAS_DOWN_M,
         detection_max_age_s: float = 0.5,
         frozen_feed_frames: int = FROZEN_FEED_FRAMES,
         min_observation_samples: int = 1,
@@ -1992,6 +2032,9 @@ class GateMission(Mission):
         self.cam_offset_right_m = cam_offset_right_m
         self.cam_offset_down_m = cam_offset_down_m
         self.cam_yaw_offset_deg = cam_yaw_offset_deg
+        # Deliberate aim bias inside the gate opening -- see
+        # GATE_AIM_BIAS_DOWN_M. Distinct from the mount offsets above.
+        self.aim_bias_down_m = aim_bias_down_m
         # Detections older than this are treated as no-detection. Guards against
         # the vision process dying while the last good pose stays latched.
         self.detection_max_age_s = detection_max_age_s
@@ -2313,7 +2356,9 @@ class GateMission(Mission):
         old yaw-only answer.
         """
         corrected_right = det.right + self.cam_offset_right_m
-        corrected_down = det.down + self.cam_offset_down_m
+        corrected_down = (
+            det.down + self.cam_offset_down_m + getattr(self, 'aim_bias_down_m', 0.0)
+        )
 
         dn, de, dd = body_to_local(
             det.forward,

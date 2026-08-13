@@ -139,6 +139,7 @@ def refresh_tracks(nav, mission, tracker: GateTracker, cfg: GateLegConfig, log) 
         cam_offset_right_m=mission.cam_offset_right_m,
         cam_offset_down_m=mission.cam_offset_down_m,
         cam_yaw_offset_deg=mission.cam_yaw_offset_deg,
+        aim_bias_down_m=getattr(mission, "aim_bias_down_m", 0.0),
         max_cone_deg=cfg.commit_max_cone_deg,
     )
     result = tracker.update(fixes, time.time())
