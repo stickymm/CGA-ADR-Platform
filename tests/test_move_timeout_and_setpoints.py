@@ -201,21 +201,53 @@ class ApproachBudgetAfterFirstFlightTests(unittest.TestCase):
     def test_commit_tolerances_must_fit_the_airframe_through_the_gate(self):
         from navigation.missions.contracts import GateLegConfig
 
-        # A 0.97 m gate with a 0.115 m airframe radius leaves 0.371 m usable.
-        GateLegConfig(commit_vertical_tol_m=0.35)          # fits
+        # A 0.97 m gate with a 0.20 m airframe radius leaves 0.286 m usable.
+        GateLegConfig(commit_vertical_tol_m=0.28)          # fits
         with self.assertRaises(ValueError) as caught:
-            GateLegConfig(commit_vertical_tol_m=0.45)      # does not
+            GateLegConfig(commit_vertical_tol_m=0.30)      # does not
         self.assertIn("usable half-opening", str(caught.exception))
 
-    def test_the_alignment_tolerances_were_NOT_loosened(self):
-        # The gate is a 0.97155 m square. With a ~0.4 m airframe there is only
-        # ~0.29 m of true clearance per side, so 0.20 / 0.25 m is already at the
-        # limit. Making the approach easier must never come from making the
-        # decision to fly at a gate easier. These two, and the confirm count,
-        # are the terms that keep a propeller out of a gate leg.
-        self.assertAlmostEqual(self.cfg.commit_lateral_tol_m, 0.20, places=9)
-        self.assertAlmostEqual(self.cfg.commit_vertical_tol_m, 0.25, places=9)
+    def test_the_alignment_tolerances_were_only_ever_TIGHTENED(self):
+        # Making the approach easier must never come from making the decision to
+        # fly at a gate easier. These are the terms that keep a propeller out of
+        # a gate leg, and they have only moved one way.
+        #
+        # 0.20/0.25 -> 0.15/0.18 on 2026-08-15. Not the fix for that flight --
+        # it committed at +0.07 lateral and +0.11 vertical, inside both -- but
+        # free margin: the three frames that actually committed measured lateral
+        # +0.06/+0.07/+0.07 and vertical +0.02/+0.05/+0.11, so the tighter gate
+        # passes identically on the flight it was tightened because of.
+        self.assertLessEqual(self.cfg.commit_lateral_tol_m, 0.20)
+        self.assertLessEqual(self.cfg.commit_vertical_tol_m, 0.25)
         self.assertEqual(self.cfg.commit_confirm_frames, 3)
+
+    def test_the_lateral_tolerance_is_not_tighter_than_a_move_can_arrive(self):
+        # A commit tolerance below arrival_tolerance_m is a leg that stalls: the
+        # approach step "arrives" outside the gate it is trying to satisfy.
+        # deadline_consistency() exists to say so, and must stay quiet.
+        from navigation.missions.contracts import deadline_consistency
+
+        self.assertGreaterEqual(
+            self.cfg.commit_lateral_tol_m, self.cfg.arrival_tolerance_m
+        )
+        self.assertEqual(deadline_consistency(self.cfg), ())
+
+    def test_the_three_committing_frames_of_2026_08_15_still_commit(self):
+        """The tightened gate must not have cost the flight it came from.
+
+        Straight from the log: obs 6, 7 and 8, the run of three that produced
+        "COMMITTING. Vision is no longer trusted".
+        """
+        MEASURED = (  # (range_m, lateral_m, vertical_m, cone_deg)
+            (1.76, +0.06, +0.02, 1.6),
+            (1.71, +0.07, +0.05, 1.8),
+            (1.71, +0.07, +0.11, 1.7),
+        )
+        for range_m, lateral, vertical, cone in MEASURED:
+            self.assertLessEqual(range_m, self.cfg.commit_distance_m)
+            self.assertLessEqual(abs(lateral), self.cfg.commit_lateral_tol_m)
+            self.assertLessEqual(abs(vertical), self.cfg.commit_vertical_tol_m)
+            self.assertLessEqual(cone, self.cfg.commit_max_cone_deg)
 
     def test_the_commit_range_clears_the_wall_the_detector_hits(self):
         """REGRESSION -- flight of 2026-08-14, and it cost the flight.

@@ -742,17 +742,43 @@ test applied to a fly-through manoeuvre — it cannot be satisfied while still m
 ```python
 along   = (state.n - fix.n)*normal_n + (state.e - fix.e)*normal_e
 cross   = (state - fix) - along*normal          # perpendicular offset from the axis
-v_along = clamp(KP_POS * (pass_distance_m - along), ±cross_speed_m_s)
-v_cross = clamp(-KP_POS * cross,                    ±cross_speed_m_s * 0.6)
+v_along = clamp(KP_POS         * (pass_distance_m - along), ±cross_speed_m_s)
+v_cross = clamp(-KP_CROSS_TRACK * cross,                    ±cross_speed_m_s * 0.8)
 ```
 
-One shared clamp is what made the aircraft veer. Committing at 1.8 m with a 1.5 m pass
-distance gives a 3.3 m along-track error, so `KP_POS × 3.3 = 3.96` m/s is scaled to 0.45 —
-a factor of 8.8 — and the cross-track term, being part of the same vector, is scaled by the
-same 8.8. A 0.10 m offset commanded 0.014 m/s of correction. The drone flew straight from
-wherever it committed and arrived off-centre by however much it was off-centre at commit.
-Reserving cross-track its own budget gives the offset a 0.83 s time constant against ~4 s
-of flight to the plane: five time constants, so it is gone before it matters.
+One shared clamp is what made the aircraft veer originally. Committing at 1.8 m with a
+1.5 m pass distance gives a 3.3 m along-track error, so `KP_POS × 3.3 = 3.96` m/s is scaled
+to 0.45 — a factor of 8.8 — and the cross-track term, being part of the same vector, is
+scaled by the same 8.8. A 0.10 m offset commanded 0.014 m/s of correction, and the drone
+flew dead straight from wherever it committed.
+
+**Separating the budgets was necessary and not sufficient.** The 2026-08-15 flight
+committed at 1.71 m, 0.05 m off the axis, cone 1.7°, three clean frames — and still tracked
+into the gate side. Simulating that geometry crosses within 0.01 m of the gate it aimed at,
+so what remains is a **constant sideways disturbance** (crosswind, or a velocity bias). A
+proportional controller does not reject one: it settles at `disturbance / gain` and *holds
+there*, on the same side every flight. That is why cross-track has its own gain
+(`KP_CROSS_TRACK = 2.5`, not `KP_POS = 1.2`) and 0.8 of the speed budget rather than 0.6 —
+at 0.6 the cap was 0.27 m/s, below a 0.30 m/s push, so the aircraft could not hold the axis
+at any gain.
+
+| disturbance | offset at plane, gain 1.2 | gain 2.5 |
+|---|---|---|
+| 0.10 m/s | 0.084 m | 0.040 m |
+| 0.20 m/s | 0.167 m | 0.080 m |
+| 0.30 m/s | 0.310 m | 0.120 m |
+
+Overshoot past the axis from a 0.30 m entry offset is 0.017 m at 0.3 s of velocity lag,
+0.052 m at 0.8 s — damped, no oscillation, at three times the lag the offline model uses.
+
+**Steering the velocity vector straight at the gate centre was tried and rejected.** Its
+effective cross-track gain is `cross_speed / distance_to_centre` = 0.45/1.71 = **0.26** at
+the start of a crossing — five times *softer* than `KP_POS` exactly when most of the
+correcting must happen. It was worse at every disturbance level tested.
+
+None of this can find the gate's *true* centre. Everything is measured against `fix`, so a
+gate localized 0.3 m off is crossed 0.3 m off, perfectly. That budget belongs to the camera
+mount offsets and `airframe_clearance_radius_m` — tape measure jobs, not code.
 
 ```
 [*] Crossing gate 0: target N=+2.77 E=+0.00 D=-1.44, 2.12m at 0.45m/s, budget 10.0s, clearance 0.80m
@@ -1227,9 +1253,9 @@ Everything tunable, in one place. **CLI flag** column blank means source-edit on
 | `gate_pose_filter_samples` | 5 | `--gate-pose-filter-samples` | Rolling median window over gate N, E, D **and heading** |
 | `max_approach_attempts` | 24 | `--max-approach-attempts` | Observations before NO_COMMIT |
 | `approach_timeout_s` | 150 s | `--approach-timeout-s` | Hard per-gate deadline |
-| `commit_lateral_tol_m` | 0.20 m | `--commit-lateral-tol-m` | Body-frame lateral term |
-| `commit_vertical_tol_m` | 0.25 m | `--commit-vertical-tol-m` | Body-frame vertical term |
-| `airframe_clearance_radius_m` | 0.115 m | `--airframe-clearance-radius-m` | Half the airframe box. Caps the two commit tolerances at the usable half-opening (validated) |
+| `commit_lateral_tol_m` | 0.15 m | `--commit-lateral-tol-m` | Body-frame lateral term. Must be ≥ `arrival_tolerance_m` or the leg stalls |
+| `commit_vertical_tol_m` | 0.18 m | `--commit-vertical-tol-m` | Body-frame vertical term |
+| `airframe_clearance_radius_m` | 0.20 m | `--airframe-clearance-radius-m` | Half the airframe box. Caps the two commit tolerances at the usable half-opening (validated). **A guess — measure it** |
 | `commit_max_cone_deg` | 60° | `--commit-max-cone-deg` | Edge-on rejection |
 | `commit_confirm_frames` | 3 | `--commit-confirm-frames` | Consecutive passes required. A **missed** observation resets the streak |
 | `max_align_attempts` | 6 | — | Align corrections before NO_COMMIT |

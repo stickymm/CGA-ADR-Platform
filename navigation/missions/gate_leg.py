@@ -61,10 +61,52 @@ from .frames import (
 
 LogFn = Callable[[str], None]
 
-# Share of ``cross_speed_m_s`` reserved for centring the aircraft on the gate
-# axis during the pass-through, held back from the along-track term so it can
-# never be squeezed out by it.  See _fly_through_gate for why that mattered.
-CROSS_TRACK_SPEED_FRACTION = 0.6
+# Share of ``cross_speed_m_s`` reserved for the cross-track and vertical axes
+# during the pass-through, held back from the along-track term so it can never
+# be squeezed out by it.
+#
+# 0.6 -> 0.8 on 2026-08-15. At 0.6 the cross-track command saturates at 0.27
+# m/s, which is less than a 0.30 m/s sideways disturbance, so the aircraft
+# simply cannot hold the axis against one: simulated offset at the gate plane
+# was 0.236 m at 0.6 and 0.120 m at 0.8. Above 0.8 nothing further improves --
+# the limit stops being authority and becomes the gain.
+CROSS_TRACK_SPEED_FRACTION = 0.8
+
+# Proportional gain for cross-track (and vertical) correction during the
+# crossing, separate from KP_POS.
+#
+# WHY IT IS NOT KP_POS, AND WHY 2.5.
+#   A proportional controller holding station against a CONSTANT sideways
+#   disturbance -- a crosswind, or a biased velocity estimate -- settles at an
+#   offset of w / gain, not at zero. That is the signature of a veer that comes
+#   back on the same side flight after flight, which is what this airframe kept
+#   producing. At KP_POS = 1.2 a 0.20 m/s disturbance parks the aircraft 0.167 m
+#   off the gate axis and holds it there. At 2.5 it is 0.080 m.
+#
+#   2.5 rather than higher because the cost is overshoot past the axis, and this
+#   airframe's velocity lag is not known. Simulated from a 0.30 m entry offset,
+#   overshoot is 0.017 m at 0.3 s of lag, 0.034 m at 0.5 s and 0.052 m at 0.8 s
+#   -- damped, no oscillation, at three times the lag the offline model uses.
+#   Gain 4.0 buys 0.03 m of disturbance rejection for another 0.01 m of
+#   overshoot and a much thinner stability margin.
+#
+# MEASURED ALTERNATIVE THAT WAS TRIED AND REJECTED: steering the velocity
+# vector straight AT the gate centre instead of parallel to the axis. It sounds
+# stronger and it is weaker -- its effective cross-track gain is
+# cross_speed / distance_to_centre, which is 0.45/1.71 = 0.26 at the start of a
+# crossing, five times SOFTER than KP_POS when most of the correcting has to
+# happen. Simulated at the 2026-08-15 commit geometry it was worse at every
+# disturbance level tested.
+KP_CROSS_TRACK = 2.5
+
+# Give up on a crossing once the aircraft has moved this far BACK from the
+# closest it got to the gate.
+#
+# Nothing this code does can produce that. On 2026-08-15 the safety pilot took
+# control four seconds in, the aircraft went from -1.71 m to -2.96 m along the
+# gate normal, and the crossing loop spent the remaining nine seconds of its
+# budget issuing setpoints nobody was reading -- then blamed the pass-through.
+RETREAT_ABORT_M = 0.5
 
 
 def approach_and_cross_one_gate(
@@ -591,34 +633,48 @@ def _fly_through_gate(
     fixed 15 s budget that a 2.5 m leg at 0.15 m/s cannot meet, that is why the
     old course mission announced success from an ignored ``False``.
 
-    WHY THE VELOCITY IS SPLIT INTO ALONG-TRACK AND CROSS-TRACK
-        This used to be one proportional term toward a point beyond the gate --
-        ``v = KP_POS * (target - state)`` -- with a single clamp on the total
-        speed.  That clamp is the bug.  Committing at 1.8 m with a 1.5 m pass
-        distance makes the along-track error 3.3 m, so ``KP_POS * 3.3 = 3.96``
-        m/s gets scaled to 0.45 m/s: a factor of 8.8.  The cross-track component
-        is scaled by the SAME factor, because it is part of the same vector.  A
-        0.10 m offset from the gate axis therefore commanded 0.014 m/s of
-        correction, which over the four seconds to the gate plane recovers
-        0.05 m of it.  The aircraft flew a straight line from wherever it
-        committed and arrived off-centre by however much it was off-centre at
-        commit -- observed on 2026-08-14 as a persistent drift to the right that
-        ended the flight in an operator abort.
+    IT FLIES THE GATE'S CENTRE AXIS, ON A SEPARATE BUDGET AND A SEPARATE GAIN
+        Velocity is decomposed about the gate's centre axis.  Along-track is
+        clamped to ``cross_speed_m_s`` on its own; cross-track and vertical get
+        ``CROSS_TRACK_SPEED_FRACTION`` of that speed, reserved, and their own
+        gain ``KP_CROSS_TRACK``.
 
-        Splitting the budget gives centring its own authority.  Along-track is
-        clamped to ``cross_speed_m_s`` on its own; cross-track and vertical each
-        get ``CROSS_TRACK_SPEED_FRACTION`` of that speed, reserved, and are
-        measured against the gate's centre AXIS rather than against the exit
-        point.  Cross-track error then decays with a time constant of
-        ``1 / KP_POS`` = 0.83 s against roughly 4 s of flight to the gate plane,
-        which is five time constants: whatever the offset was at commit, it is
-        gone by the time it matters.
+        THE ORIGINAL BUG was one proportional term toward a point beyond the
+        gate with a single clamp on the total speed.  Committing at 1.8 m with a
+        1.5 m pass distance makes the along-track error 3.3 m, so
+        ``KP_POS * 3.3 = 3.96`` m/s is scaled to 0.45 -- a factor of 8.8 -- and
+        the cross-track component, part of the same vector, is scaled by the
+        same 8.8.  A 0.10 m offset commanded 0.014 m/s of correction, and the
+        aircraft flew a dead straight line from wherever it committed.
 
-        Total commanded speed can therefore reach ``hypot(1, 0.6, 0.6)`` = 1.31x
-        ``cross_speed_m_s``.  That is intended and it is the same reasoning as
-        :func:`~navigation.missions.frames.limit_approach_step` -- it is the
-        progress being protected, not the vector magnitude -- and 0.59 m/s is
-        still far below anything the airframe minds.
+        WHAT THE 2026-08-15 FLIGHT THEN SHOWED is that separating the budgets
+        was necessary and not sufficient.  It committed at 1.71 m with a
+        measured 0.05 m offset from the axis, cone 1.7 deg, three clean frames
+        -- and still tracked into the gate side.  Simulating that exact geometry
+        says the controller would have crossed within 0.01 m of the gate it was
+        aimed at, so what is left is a CONSTANT sideways disturbance: crosswind,
+        or a velocity bias.  A proportional controller does not reject one.  It
+        settles at ``disturbance / gain`` and holds there -- 0.167 m at
+        ``KP_POS``, on the same side every flight, which is exactly the reported
+        symptom.  Hence ``KP_CROSS_TRACK`` and the raised speed share; see their
+        definitions for the numbers and for the alternative that was rejected.
+
+        WHAT THIS STILL CANNOT DO is find the gate's true centre.  Everything
+        here is measured against ``fix``, so a gate localized 0.3 m off is
+        crossed 0.3 m off, perfectly.  That budget belongs to the camera mount
+        offsets and to ``airframe_clearance_radius_m``, and those are tape
+        measure jobs, not code.
+
+    IT ALSO HAS TO NOTICE WHEN IT IS NO LONGER FLYING THE AIRCRAFT
+        The loop used to check only ``nav.running``.  On 2026-08-15 the safety
+        pilot took control four seconds into the crossing; PX4 stopped consuming
+        the setpoints, the aircraft was flown backwards 1.25 m, and this
+        function kept issuing velocity commands for the remaining nine seconds
+        of its budget before reporting "pass-through did not clear the gate
+        plane".  That diagnosis is wrong and it costs a debug cycle to unpick.
+        Two guards now: OFFBOARD is re-checked every tick, and sustained
+        movement AWAY from the gate ends the crossing rather than waiting out
+        the clock.
     """
     target = pass_through_target(fix, cfg.pass_distance_m, envelope)
     state = nav.get_vehicle_snapshot()
@@ -637,38 +693,64 @@ def _fly_through_gate(
     )
     log(
         f"    entering {entry_cross:.2f}m off the gate axis; centring at up to "
-        f"{cfg.cross_speed_m_s * CROSS_TRACK_SPEED_FRACTION:.2f}m/s while flying through"
+        f"{cfg.cross_speed_m_s * CROSS_TRACK_SPEED_FRACTION:.2f}m/s "
+        f"(gain {KP_CROSS_TRACK:.1f}) while flying through"
     )
 
     period = 1.0 / POSITION_RATE_HZ
     started = time.time()
     cross_budget = cfg.cross_speed_m_s * CROSS_TRACK_SPEED_FRACTION
     plane_reported = False
+    best_along = entry_along
 
     try:
         while nav.running:
             state = nav.get_vehicle_snapshot()
 
+            if not state.in_offboard:
+                log(
+                    f"[!] PX4 left OFFBOARD {time.time() - started:.1f}s into the "
+                    f"crossing -- almost certainly the safety pilot took control. "
+                    f"The aircraft is no longer following these setpoints"
+                    + nav.estimator_note()
+                )
+                return False
+
             # Position decomposed about the gate's centre axis: how far along the
-            # direction of travel, and how far off the line.
+            # direction of travel, and how far off the line.  cross_right is
+            # SIGNED -- positive is the gate's own right-hand side, looking
+            # through it in the direction of travel -- because a systematic
+            # mounting or calibration error shows up as a consistent sign, and a
+            # magnitude hides exactly that.
             along = (state.n - fix.n) * fix.normal_n + (state.e - fix.e) * fix.normal_e
             cross_n = (state.n - fix.n) - along * fix.normal_n
             cross_e = (state.e - fix.e) - along * fix.normal_e
-            cross_m = math.hypot(cross_n, cross_e)
+            cross_right = cross_n * -fix.normal_e + cross_e * fix.normal_n
 
             # The one number that says whether this crossing went through the
             # middle.  Printed once, at the moment the aircraft is in the gate.
             if along >= 0.0 and not plane_reported:
                 plane_reported = True
                 log(
-                    f"[*] Gate {gate_index} AT THE PLANE: {cross_m:.2f}m off centre "
-                    f"laterally, {state.d - fix.d:+.2f}m vertically"
+                    f"[*] Gate {gate_index} AT THE PLANE: {cross_right:+.2f}m off centre "
+                    f"({'RIGHT' if cross_right >= 0 else 'LEFT'} of the gate centre), "
+                    f"{state.d - fix.d:+.2f}m vertically"
                 )
 
             if crossed_gate_plane(state.n, state.e, fix, cfg.exit_clearance_m):
                 log(f"[*] Gate {gate_index} CROSSED (past the plane by "
                     f"{cfg.exit_clearance_m:.2f}m)")
                 return True
+
+            best_along = max(best_along, along)
+            if along < best_along - RETREAT_ABORT_M:
+                log(
+                    f"[!] Crossing abandoned: the aircraft is {best_along - along:.2f}m "
+                    f"BACK from the closest it got to the gate ({best_along:+.2f}m along "
+                    f"the normal, now {along:+.2f}m). It is being flown by something "
+                    f"other than this code"
+                )
+                return False
 
             if time.time() - started > budget_s:
                 log(
@@ -681,10 +763,10 @@ def _fly_through_gate(
             v_along = KP_POS * (cfg.pass_distance_m - along)
             v_along = max(-cfg.cross_speed_m_s, min(cfg.cross_speed_m_s, v_along))
 
-            # Cross-track: drive the offset from the gate axis to zero, with a
-            # reserved share of the speed budget.
-            v_cross_n = -KP_POS * cross_n
-            v_cross_e = -KP_POS * cross_e
+            # Cross-track: drive the offset from the gate's centre AXIS to zero,
+            # on its own gain and its own reserved share of the speed budget.
+            v_cross_n = -KP_CROSS_TRACK * cross_n
+            v_cross_e = -KP_CROSS_TRACK * cross_e
             cross_speed = math.hypot(v_cross_n, v_cross_e)
             if cross_speed > cross_budget:
                 scale = cross_budget / cross_speed
@@ -693,7 +775,7 @@ def _fly_through_gate(
 
             vn = v_along * fix.normal_n + v_cross_n
             ve = v_along * fix.normal_e + v_cross_e
-            vd = KP_POS * (target.d - state.d)
+            vd = KP_CROSS_TRACK * (target.d - state.d)
             vd = max(-cross_budget, min(cross_budget, vd))
 
             nav.set_setpoint(

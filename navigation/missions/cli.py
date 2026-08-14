@@ -94,8 +94,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
              "solvePnP saturates), so 1.0 m was unreachable and the leg could "
              "never commit",
     )
-    gate.add_argument("--commit-lateral-tol-m", type=float, default=0.20)
-    gate.add_argument("--commit-vertical-tol-m", type=float, default=0.25)
+    gate.add_argument("--commit-lateral-tol-m", type=float, default=0.15)
+    gate.add_argument("--commit-vertical-tol-m", type=float, default=0.18)
     gate.add_argument("--commit-max-cone-deg", type=float, default=60.0)
     gate.add_argument("--commit-confirm-frames", type=int, default=3)
     gate.add_argument(
@@ -183,9 +183,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     hardware.add_argument(
         "--airframe-clearance-radius-m",
         type=float,
-        default=0.115,
-        help="half the airframe bounding box, prop tip to prop tip (0.115 = "
-             "half a 9 inch box). The camera measures the gate, not the drone",
+        default=0.20,
+        help="half the airframe bounding box, prop tip to prop tip. The camera "
+             "measures the gate, not the drone. MEASURE THIS -- 0.20 is a guess "
+             "and it sets the ceiling the commit tolerances are validated against",
     )
     hardware.add_argument("--camera-down-offset-m", type=float,
                           default=CAM_OFFSET_DOWN_M,

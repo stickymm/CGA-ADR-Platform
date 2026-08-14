@@ -244,6 +244,135 @@ class CrossingCentresOnTheGateAxisTests(unittest.TestCase):
         _crossed, trace = self._cross_track_over_time(cfg, offset_right_m=y0)
         self.assertLess(abs(trace[-1]), straight_line_offset / 2.0)
 
+    def _cross_track_under_disturbance(self, cfg, drift_m_s):
+        """Fly a centred crossing while something pushes sideways the whole way."""
+        fix = gate_fix(n=1.8, e=0.0, d=-1.35, normal=(1.0, 0.0))
+        self.nav.set_state(n=0.0, e=0.0, d=-1.35, yaw_rad=0.0)
+        original = self.nav.send_velocity_and_yaw_target
+
+        def pushed(vn, ve, vd, yaw_rad):
+            # +E is perpendicular to the +N normal: a pure cross-track push.
+            original(vn, ve + drift_m_s, vd, yaw_rad)
+
+        self.nav.send_velocity_and_yaw_target = pushed
+        offsets = []
+        snapshot = self.nav.get_vehicle_snapshot
+
+        def sampling():
+            state = snapshot()
+            offsets.append(state.e - fix.e)
+            return state
+
+        self.nav.get_vehicle_snapshot = sampling
+        with patch.object(gate_leg, "time", self.clock):
+            gate_leg._fly_through_gate(
+                self.nav, fix, cfg, cfg.altitude, 0, log=RecordingLog()
+            )
+        return max(abs(o) for o in offsets)
+
+    def test_a_constant_sideways_push_is_rejected_better_than_KP_POS_would(self):
+        """REGRESSION -- flight of 2026-08-15, and it is the whole reason for
+        a separate cross-track gain.
+
+        That flight committed at 1.71 m with a measured 0.05 m offset from the
+        axis, cone 1.7 deg, three clean frames -- and still tracked into the
+        gate side. Simulating that geometry says the controller crosses within
+        0.01 m of the gate it is aimed at, so what is left is a CONSTANT
+        sideways disturbance: crosswind, or a velocity bias.
+
+        A proportional controller does not reject one. It settles at
+        disturbance/gain and holds there, on the same side every flight. The
+        only lever is the gain, so the gain must not be KP_POS.
+        """
+        from navigation.navigation import KP_POS
+
+        self.assertGreater(gate_leg.KP_CROSS_TRACK, KP_POS)
+
+        cfg = leg_config(commit_distance_m=1.8, pass_distance_m=1.5,
+                         exit_clearance_m=0.8)
+        DRIFT = 0.20
+        settled = self._cross_track_under_disturbance(cfg, DRIFT)
+
+        # Steady state is drift/gain. Allow slack for the approach transient.
+        self.assertLess(settled, DRIFT / KP_POS,
+                        f"no better than the old KP_POS would have managed: {settled:.3f}")
+        self.assertLess(settled, DRIFT / gate_leg.KP_CROSS_TRACK + 0.05, settled)
+
+    def test_the_cross_track_budget_outruns_a_realistic_disturbance(self):
+        # A speed cap below the disturbance means the aircraft cannot hold the
+        # axis at all, however high the gain. At 0.6 the cap was 0.27 m/s.
+        cfg = leg_config()
+        budget = cfg.cross_speed_m_s * gate_leg.CROSS_TRACK_SPEED_FRACTION
+        self.assertGreaterEqual(budget, 0.30)
+
+    def test_the_crossing_stops_when_px4_leaves_offboard(self):
+        """REGRESSION -- flight of 2026-08-15.
+
+        The safety pilot took control four seconds into the crossing. The loop
+        checked only nav.running, so it spent the remaining nine seconds of its
+        budget issuing setpoints nobody was reading, then reported
+        "pass-through did not clear the gate plane" -- blaming the manoeuvre for
+        the operator's intervention.
+        """
+        fix = gate_fix(n=1.8, e=0.0, d=-1.35, normal=(1.0, 0.0))
+        self.nav.set_state(n=0.0, e=0.0, d=-1.35, yaw_rad=0.0, custom_mode=0)
+        log = RecordingLog()
+        with patch.object(gate_leg, "time", self.clock):
+            crossed = gate_leg._fly_through_gate(
+                self.nav, fix, leg_config(), self.nav.altitude_envelope, 0, log=log
+            )
+
+        self.assertFalse(crossed)
+        self.assertTrue(log.contains("left OFFBOARD"))
+        self.assertTrue(log.contains("safety pilot"))
+
+    def test_the_crossing_stops_when_the_aircraft_is_flown_backwards(self):
+        """REGRESSION -- flight of 2026-08-15, same event, second guard.
+
+        The aircraft went from -1.71 m to -2.96 m along the gate normal because
+        the operator pulled it back off the gate. Nothing this code does can
+        produce that, so sustained retreat means something else is flying --
+        and waiting out the clock only delays saying so.
+        """
+        fix = gate_fix(n=1.8, e=0.0, d=-1.35, normal=(1.0, 0.0))
+        self.nav.set_state(n=0.0, e=0.0, d=-1.35, yaw_rad=0.0)
+        log = RecordingLog()
+
+        # Drag the vehicle backwards regardless of what is commanded.
+        original = self.nav.send_velocity_and_yaw_target
+
+        def dragged_backwards(vn, ve, vd, yaw_rad):
+            original(vn, ve, vd, yaw_rad)
+            s = self.nav.get_vehicle_snapshot()
+            self.nav.set_state(n=s.n - 0.2, e=s.e, d=s.d, yaw_rad=s.yaw_rad)
+
+        self.nav.send_velocity_and_yaw_target = dragged_backwards
+        with patch.object(gate_leg, "time", self.clock):
+            crossed = gate_leg._fly_through_gate(
+                self.nav, fix, leg_config(), self.nav.altitude_envelope, 0, log=log
+            )
+
+        self.assertFalse(crossed)
+        self.assertTrue(log.contains("Crossing abandoned"))
+        self.assertFalse(log.contains("timed out"))
+
+    def test_the_offset_at_the_plane_is_signed_so_a_bias_is_visible(self):
+        # A magnitude hides a systematic mounting or calibration error; a sign
+        # that comes back RIGHT every flight names it.
+        cfg = leg_config(commit_distance_m=1.8, pass_distance_m=1.5,
+                         exit_clearance_m=0.8)
+        fix = gate_fix(n=1.8, e=0.0, d=-1.35, normal=(1.0, 0.0))
+        self.nav.set_state(n=0.0, e=0.30, d=-1.35, yaw_rad=0.0)
+        log = RecordingLog()
+        with patch.object(gate_leg, "time", self.clock):
+            gate_leg._fly_through_gate(
+                self.nav, fix, cfg, cfg.altitude, 0, log=log
+            )
+
+        # +E is the gate's right-hand side looking along a +N normal.
+        self.assertTrue(log.contains("AT THE PLANE"))
+        self.assertTrue(log.contains("RIGHT of the gate centre"), log.text)
+
     def test_the_cross_track_offset_at_the_plane_is_logged(self):
         # The single most useful number for debugging the next flight from a
         # console log alone: did it actually go through the middle?

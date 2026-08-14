@@ -261,9 +261,20 @@ class GateLegConfig:
     # behind it is, and the propellers span far more than the lens.
     #
     # Half the airframe's bounding box, propeller tip to propeller tip, plus
-    # whatever margin you want. 0.115 m is half of the 9 inch box other teams
-    # have used. Set it from a tape measure across your own props.
-    airframe_clearance_radius_m: float = 0.115
+    # whatever margin you want.
+    #
+    # RAISED 0.115 -> 0.20 after 2026-08-15, when a crossing committed at a
+    # measured 0.05 m from the gate axis -- as centred as this stack has ever
+    # been -- and still tracked into the gate side. 0.115 m was half of a 9 inch
+    # box, which is a small number for a quadcopter carrying props and a
+    # battery, and it was doing real work: it set the ceiling the commit
+    # tolerances were validated against.
+    #
+    # THIS IS STILL A GUESS AND IT IS THE WRONG KIND OF NUMBER TO GUESS. Put a
+    # tape measure across your own props, tip to opposite tip, halve it, and set
+    # it. The gate is 0.97 m; every centimetre here comes straight off the
+    # margin the commit gate is allowed to spend.
+    airframe_clearance_radius_m: float = 0.20
     # Inner opening of the gate, matching vision/opencv_processing.py's
     # HALF_SIZE * 2 -- the same square solvePnP is scaling every distance from.
     gate_inner_size_m: float = 0.97155
@@ -283,8 +294,20 @@ class GateLegConfig:
     arrival_tolerance_m: float = 0.15
 
     # --- commit gate (range AND alignment AND not edge-on) ---
-    commit_lateral_tol_m: float = 0.20
-    commit_vertical_tol_m: float = 0.25
+    #
+    # TIGHTENED 0.20/0.25 -> 0.15/0.18 after 2026-08-15. This is not the fix for
+    # that flight -- it committed at +0.07 m lateral and +0.11 m vertical, well
+    # inside even the new numbers -- so tightening would not have changed it.
+    # It is margin, bought at no cost: the three frames that actually committed
+    # measured lateral +0.06 / +0.07 / +0.07 and vertical +0.02 / +0.05 / +0.11,
+    # so the tighter gate would have passed identically on the flight it is
+    # being tightened because of.
+    #
+    # 0.15 and not smaller: arrival_tolerance_m is 0.15, and a commit tolerance
+    # BELOW the tolerance an approach step can arrive within is a leg that stalls
+    # -- deadline_consistency() flags exactly that and the banner prints it.
+    commit_lateral_tol_m: float = 0.15
+    commit_vertical_tol_m: float = 0.18
     commit_max_cone_deg: float = 60.0
     commit_confirm_frames: int = 3
     # Raised 4 -> 6 alongside commit_distance_m. The ALIGN branch fires whenever
