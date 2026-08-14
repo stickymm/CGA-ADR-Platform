@@ -18,7 +18,8 @@ STATE MACHINE -- every state is bounded, every exit is named
 
     SEARCH -> APPROACH -> ALIGN -> COMMIT -> EXIT
 
-    SEARCH    hold and re-observe; then a bounded yaw sweep; then back off,
+    SEARCH    hold and re-observe; then return to the pose the gate was last
+              seen from; then a bounded observing yaw sweep; then back off,
               because a gate is most often lost by getting too close for it to
               fit in frame and retreating widens the field of view again.
     APPROACH  step toward a standoff point on the gate's centre axis.
@@ -31,7 +32,9 @@ STATE MACHINE -- every state is bounded, every exit is named
 
 import math
 import time
-from typing import Callable, Optional
+from dataclasses import replace
+from statistics import median
+from typing import Callable, List, Optional
 
 from ..navigation import (
     LocalTarget,
@@ -118,6 +121,9 @@ def approach_and_cross_one_gate(
     reacquires = 0
     confirmed_frames = 0
     last_fix: Optional[GateFix] = None
+    last_seen_state = None          # drone pose when the gate was last seen
+    returned_to_last_seen = False
+    altitude_history: List[float] = []
 
     def finish(result: GateResult, reason: str) -> GateOutcome:
         log(f"[*] Gate {gate_index}: {result.value.upper()} -- {reason}")
@@ -187,6 +193,36 @@ def approach_and_cross_one_gate(
                 continue
 
             reacquires += 1
+
+            # ---- rung 1.5: go back to where it was last visible ----
+            # Cheapest recovery there is, and the most likely to work: the gate
+            # was in frame from that exact pose a few seconds ago. Anything that
+            # has happened since -- drift, a step that overshot, altitude creep
+            # -- is undone by returning. Tried ONCE, before spending time on a
+            # yaw sweep, because if the aircraft simply wandered off the sight
+            # line then sweeping from the wrong place searches the wrong volume.
+            if last_seen_state is not None and not returned_to_last_seen:
+                returned_to_last_seen = True
+                observe_failures = 0
+                recovered_d, _ = clamp_altitude(last_seen_state.d, envelope)
+                log(
+                    f"[*] Recovery rung 1: returning to where the gate was last "
+                    f"seen -- N={last_seen_state.n:+.2f} E={last_seen_state.e:+.2f} "
+                    f"D={recovered_d:+.2f} yaw={math.degrees(last_seen_state.yaw_rad):+.0f}deg"
+                )
+                nav.move_to_target(
+                    LocalTarget(
+                        n=last_seen_state.n,
+                        e=last_seen_state.e,
+                        d=recovered_d,
+                        yaw_rad=last_seen_state.yaw_rad,
+                    ),
+                    f"gate {gate_index} return to last sighting",
+                    max_speed_m_s=cfg.approach_speed_m_s,
+                    tolerance_m=cfg.arrival_tolerance_m,
+                )
+                continue
+
             if scans_used < cfg.max_scan_sweeps:
                 scans_used += 1
                 observe_failures = 0
@@ -312,7 +348,31 @@ def approach_and_cross_one_gate(
                     )
                 continue
 
+        # ---------------- steady the gate's altitude ----------------
+        # The gate does not move; its estimated height does, by 0.46 m across
+        # six observations of one stationary gate in flight. Aiming at each raw
+        # value makes the aircraft chase noise instead of converging, and the
+        # vertical axis is where that costs the most -- too high and the gate
+        # leaves the top of the frame entirely.
+        #
+        # The commit check is re-derived from the SAME filtered altitude, so the
+        # decision and the target can never disagree about where the gate is.
+        # (Level approximation: the body-frame vertical offset is the NED
+        # difference, exact at zero tilt and within a centimetre at the 1-2
+        # degrees these approaches actually fly.)
+        altitude_history.append(fix.d)
+        del altitude_history[: max(0, len(altitude_history) - cfg.gate_altitude_filter_samples)]
+        steady_d = median(altitude_history)
+        if abs(steady_d - fix.d) > 1e-9:
+            log(
+                f"    altitude steadied: raw d={fix.d:+.2f} -> median of "
+                f"{len(altitude_history)} = {steady_d:+.2f} "
+                f"({steady_d - fix.d:+.2f} m correction)"
+            )
+            fix = replace(fix, d=steady_d, vertical_body_m=steady_d - state.d)
+
         last_fix = fix
+        last_seen_state = state
         _log_fix(fix, state, gate_index, attempts, envelope, log)
 
         verdict = evaluate_commit(fix, cfg)

@@ -169,12 +169,52 @@ class GateLegConfig:
     approach_timeout_s: float = 150.0
 
     # Vertical budget for one approach step, spent independently of the
-    # horizontal one. Deliberately small: the gate's measured height is the
-    # noisiest quantity in the whole pipeline (0.63 m of swing observed in
-    # flight), altitude error is not urgent, and it corrects a little on every
-    # attempt. Capping it here is what stops that noise consuming the forward
-    # progress -- see frames.limit_approach_step.
-    vertical_step_m: float = 0.12
+    # horizontal one, so gate-height noise cannot consume the forward progress
+    # (see frames.limit_approach_step).
+    #
+    # IT MUST EXCEED arrival_tolerance_m, AND THAT IS NOT A STYLE PREFERENCE.
+    #   move_to_target's arrival test is a 3-D distance. If the commanded
+    #   vertical step is smaller than that tolerance, then hypot(0, 0, step) is
+    #   already inside it, and the move reports "Reached" the instant the
+    #   HORIZONTAL error closes -- with the entire vertical step still
+    #   outstanding. The guaranteed descent per attempt is then exactly zero.
+    #
+    #   This shipped at 0.12 against a 0.15 m tolerance and did precisely that.
+    #   Flight of 2026-08-14: five consecutive moves each commanded a 0.12 m
+    #   descent; the net altitude change across all five was -0.01 m. The
+    #   aircraft held 0.50 m above the gate for the whole approach and
+    #   eventually lost sight of it over the top.
+    #
+    #   With step > tolerance the achieved descent is at least
+    #   (step - tolerance) every attempt. __post_init__ enforces it.
+    vertical_step_m: float = 0.25
+
+    # Rolling median window for the gate's estimated altitude.
+    #
+    # The gate never moves, but its estimated height is the noisiest quantity in
+    # the pipeline: 0.46 m of spread across six observations of one stationary
+    # gate. Re-aiming at each raw value is the "keeps readjusting" behaviour --
+    # the aircraft chases noise instead of converging.
+    #
+    # A MEDIAN, not a mean: it discards outliers rather than mixing them in.
+    # A ROLLING window, not an early lock: the far-range estimates are the
+    # WORST ones (a 0.97 m square subtends little at 3 m and the PnP scale is
+    # poorly conditioned), so freezing the first few would lock in the least
+    # trustworthy number available. It converges as the aircraft closes, which
+    # is exactly when it matters.
+    gate_altitude_filter_samples: int = 5
+
+    # --- airframe geometry -------------------------------------------------
+    # The camera reports where the GATE is. It has no idea how big the aircraft
+    # behind it is, and the propellers span far more than the lens.
+    #
+    # Half the airframe's bounding box, propeller tip to propeller tip, plus
+    # whatever margin you want. 0.115 m is half of the 9 inch box other teams
+    # have used. Set it from a tape measure across your own props.
+    airframe_clearance_radius_m: float = 0.115
+    # Inner opening of the gate, matching vision/opencv_processing.py's
+    # HALF_SIZE * 2 -- the same square solvePnP is scaling every distance from.
+    gate_inner_size_m: float = 0.97155
 
     # Fewest averaged detections that may be called a "lock". In flight one
     # observation window produced a single sample and reported a range that
@@ -258,6 +298,41 @@ class GateLegConfig:
 
         if self.min_observation_samples < 1:
             raise ValueError("min_observation_samples must be at least 1")
+        if self.gate_altitude_filter_samples < 1:
+            raise ValueError("gate_altitude_filter_samples must be at least 1")
+
+        # THE ONE THAT COST A FLIGHT. A vertical step inside the arrival
+        # tolerance is a vertical step that never has to be flown.
+        if self.vertical_step_m <= self.arrival_tolerance_m:
+            raise ValueError(
+                f"vertical_step_m ({self.vertical_step_m:.2f} m) must be LARGER than "
+                f"arrival_tolerance_m ({self.arrival_tolerance_m:.2f} m). The arrival "
+                f"test is a 3-D distance, so a smaller vertical step is already "
+                f"inside it: every move would report 'Reached' with the whole "
+                f"descent still outstanding, and the aircraft would never change "
+                f"altitude at all."
+            )
+
+        # The camera measures the gate; it does not measure the aircraft. A
+        # commit tolerance wider than the real clearance says "close enough"
+        # about a position that puts a propeller into a gate leg.
+        usable = self.gate_inner_size_m / 2.0 - self.airframe_clearance_radius_m
+        if usable <= 0.0:
+            raise ValueError(
+                f"airframe_clearance_radius_m ({self.airframe_clearance_radius_m:.3f} m) "
+                f"leaves no room in a {self.gate_inner_size_m:.3f} m gate"
+            )
+        for name, tolerance in (
+            ("commit_lateral_tol_m", self.commit_lateral_tol_m),
+            ("commit_vertical_tol_m", self.commit_vertical_tol_m),
+        ):
+            if tolerance > usable:
+                raise ValueError(
+                    f"{name} ({tolerance:.2f} m) exceeds the usable half-opening "
+                    f"({usable:.2f} m = {self.gate_inner_size_m/2:.2f} m half-gate "
+                    f"- {self.airframe_clearance_radius_m:.3f} m airframe). Committing "
+                    f"at that offset can put a propeller into the frame."
+                )
 
         # An arrival tolerance at or above the step size makes every approach
         # step arrive before it moves, so the drone would "approach" the gate by
@@ -361,9 +436,17 @@ def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
         ("commit max cone", f"{cfg.commit_max_cone_deg:.1f} deg"),
         ("commit confirm frames", f"{cfg.commit_confirm_frames}"),
         ("approach step", f"{cfg.step_size_m:.2f} m horizontal, "
-                          f"{cfg.vertical_step_m:.2f} m vertical"),
+                          f"{cfg.vertical_step_m:.2f} m vertical "
+                          f"(>= {cfg.vertical_step_m - cfg.arrival_tolerance_m:.2f} m "
+                          f"descent guaranteed per attempt)"),
         ("arrival tolerance", f"{cfg.arrival_tolerance_m:.2f} m"),
         ("min samples per lock", f"{cfg.min_observation_samples}"),
+        ("gate altitude filter", f"median of {cfg.gate_altitude_filter_samples} "
+                                 f"observations"),
+        ("airframe clearance", f"{cfg.airframe_clearance_radius_m:.3f} m radius; "
+                               f"usable half-opening "
+                               f"{cfg.gate_inner_size_m/2 - cfg.airframe_clearance_radius_m:.2f} m "
+                               f"in a {cfg.gate_inner_size_m:.2f} m gate"),
         ("approach speed", f"{cfg.approach_speed_m_s:.2f} m/s"),
         ("cross speed", f"{cfg.cross_speed_m_s:.2f} m/s"),
         ("pass distance", f"{cfg.pass_distance_m:.2f} m"),

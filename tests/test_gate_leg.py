@@ -436,6 +436,115 @@ class RecoveryLadderTests(unittest.TestCase):
         self.assertLessEqual(len(self.nav.slews), 3 * 2)
 
 
+class GateAltitudeSteadyingTests(unittest.TestCase):
+    """The gate does not move. Its estimated height does, by 0.46 m."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.nav = FakeNav(self.clock)
+        self.nav.integrate_velocity = True
+
+    def test_an_outlier_altitude_does_not_move_the_target(self):
+        """REGRESSION -- flight of 2026-08-14.
+
+        Six observations of one stationary gate reported it between 0.95 m and
+        1.41 m AGL. Re-aiming at each raw value is the "keeps readjusting"
+        behaviour: the aircraft chases noise instead of converging, and on the
+        vertical axis that ends with the gate out of the top of the frame.
+
+        A median, not a mean -- an outlier should be discarded, not averaged in.
+        """
+        # Four consistent observations then one wild one.
+        steady = detection(forward=2.0, down=0.20, dist=2.0)
+        outlier = detection(forward=2.0, down=0.80, dist=2.1)
+        mission = ScriptedMission([steady, steady, steady, outlier, COMMITTABLE])
+        run_leg(self.nav, mission, leg_config(gate_altitude_filter_samples=5), self.clock)
+
+        # The move issued right after the outlier must not have chased it.
+        commanded_d = [target.d for _label, target, *_ in self.nav.moves]
+        self.assertTrue(commanded_d)
+        self.assertLess(max(commanded_d) - min(commanded_d), 0.30, commanded_d)
+
+    def test_the_filter_is_reported_so_it_is_never_invisible(self):
+        steady = detection(forward=2.0, down=0.20, dist=2.0)
+        outlier = detection(forward=2.0, down=0.90, dist=2.1)
+        mission = ScriptedMission([steady, steady, outlier, COMMITTABLE])
+        _outcome, log = run_leg(self.nav, mission, leg_config(), self.clock)
+
+        self.assertTrue(log.contains("altitude steadied"))
+
+    def test_a_single_sample_window_is_the_raw_value(self):
+        # Degenerate but legal: filtering over one sample changes nothing.
+        mission = ScriptedMission([COMMITTABLE])
+        _outcome, log = run_leg(
+            self.nav, mission, leg_config(gate_altitude_filter_samples=1), self.clock
+        )
+        self.assertFalse(log.contains("altitude steadied"))
+
+
+class ReturnToLastSightingTests(unittest.TestCase):
+    """Losing the gate should first undo whatever movement lost it."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.nav = FakeNav(self.clock)
+        self.nav.integrate_velocity = True
+
+    def test_losing_the_gate_returns_to_where_it_was_last_seen(self):
+        # See it once, then lose it. The cheapest recovery is to go back to the
+        # pose it was visible from -- it was in frame there seconds ago.
+        mission = ScriptedMission([FAR] + [None] * 30)
+        _outcome, log = run_leg(
+            self.nav,
+            mission,
+            leg_config(max_observe_retries=1, max_scan_sweeps=1, max_backoffs=0),
+            self.clock,
+        )
+
+        self.assertTrue(log.contains("returning to where the gate was last seen"))
+        labels = [label for label, *_ in self.nav.moves]
+        self.assertTrue(any("return to last sighting" in label for label in labels))
+
+    def test_the_return_happens_before_the_yaw_sweep(self):
+        # Sweeping from the wrong place searches the wrong volume.
+        mission = ScriptedMission([FAR] + [None] * 30)
+        _outcome, log = run_leg(
+            self.nav,
+            mission,
+            leg_config(max_observe_retries=1, max_scan_sweeps=1, max_backoffs=0),
+            self.clock,
+        )
+
+        text = log.text
+        self.assertLess(
+            text.index("returning to where the gate was last seen"),
+            text.index("Recovery rung 2"),
+        )
+
+    def test_it_is_tried_once_and_not_repeatedly(self):
+        mission = ScriptedMission([FAR] + [None] * 60)
+        run_leg(
+            self.nav,
+            mission,
+            leg_config(max_observe_retries=1, max_scan_sweeps=2, max_backoffs=2),
+            self.clock,
+        )
+
+        returns = [
+            label for label, *_ in self.nav.moves if "return to last sighting" in label
+        ]
+        self.assertEqual(len(returns), 1)
+
+    def test_a_gate_never_seen_has_nowhere_to_return_to(self):
+        _outcome, log = run_leg(
+            self.nav,
+            ScriptedMission([None]),
+            leg_config(max_observe_retries=1, max_scan_sweeps=1, max_backoffs=0),
+            self.clock,
+        )
+        self.assertFalse(log.contains("returning to where the gate was last seen"))
+
+
 class CrossedGateGuardTests(unittest.TestCase):
     """Multi-gate: a gate must not be counted, or flown, twice."""
 

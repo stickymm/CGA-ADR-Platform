@@ -94,10 +94,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     gate.add_argument(
         "--vertical-step-m",
         type=float,
-        default=0.12,
-        help="vertical displacement cap for one approach step, budgeted "
-             "separately so noisy gate-height estimates cannot eat the forward "
-             "progress",
+        default=0.25,
+        help="vertical cap for one approach step, budgeted separately from the "
+             "horizontal one. MUST exceed --arrival-tolerance-m or the move "
+             "arrives without ever descending",
     )
     gate.add_argument(
         "--min-observation-samples",
@@ -136,6 +136,13 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="commanded yaw rate for searches and turns. Do not rely on PX4's "
              "MPC_YAWRAUTO_MAX for this -- fast yaw degrades optical flow",
     )
+    gate.add_argument(
+        "--gate-altitude-filter-samples",
+        type=int,
+        default=5,
+        help="rolling median window for the gate height, so the aircraft stops "
+             "re-aiming at per-observation noise",
+    )
     limits.add_argument("--max-observe-retries", type=int, default=3)
     limits.add_argument("--max-scan-sweeps", type=int, default=2,
                         help="each sweep observes at every heading, and sweep N "
@@ -156,6 +163,13 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
     hardware = parser.add_argument_group("hardware")
     hardware.add_argument("--mavlink", default=MAVLINK_CONN)
+    hardware.add_argument(
+        "--airframe-clearance-radius-m",
+        type=float,
+        default=0.115,
+        help="half the airframe bounding box, prop tip to prop tip (0.115 = "
+             "half a 9 inch box). The camera measures the gate, not the drone",
+    )
     hardware.add_argument("--camera-down-offset-m", type=float,
                           default=CAM_OFFSET_DOWN_M,
                           help="+ve = camera mounted BELOW the vehicle reference; flies the drone LOWER")
@@ -246,6 +260,8 @@ def build_leg_config(args, envelope: AltitudeEnvelope) -> GateLegConfig:
         max_detection_age_s=args.max_detection_age_s,
         arrival_tolerance_m=args.arrival_tolerance_m,
         vertical_step_m=args.vertical_step_m,
+        gate_altitude_filter_samples=args.gate_altitude_filter_samples,
+        airframe_clearance_radius_m=args.airframe_clearance_radius_m,
         crossed_gate_avoid_m=args.crossed_gate_avoid_m,
         min_observation_samples=args.min_observation_samples,
         altitude=envelope,

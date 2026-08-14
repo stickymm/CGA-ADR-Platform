@@ -170,9 +170,42 @@ class ApproachBudgetAfterFirstFlightTests(unittest.TestCase):
         # Raising step_size_m must not let a step "arrive" without moving.
         self.assertLess(self.cfg.arrival_tolerance_m, self.cfg.step_size_m)
 
-    def test_the_vertical_budget_stays_well_under_the_horizontal_one(self):
-        # The whole point is that the noisy axis cannot dominate the step.
-        self.assertLess(self.cfg.vertical_step_m, self.cfg.step_size_m / 2.0)
+    def test_the_vertical_budget_stays_under_the_horizontal_one(self):
+        # The noisy axis must not dominate the step...
+        self.assertLess(self.cfg.vertical_step_m, self.cfg.step_size_m)
+
+    def test_the_vertical_step_must_exceed_the_arrival_tolerance(self):
+        """REGRESSION -- flight of 2026-08-14, and it grounded the approach.
+
+        move_to_target's arrival test is a 3-D distance. A vertical step smaller
+        than that tolerance is already inside it, so the move reports "Reached"
+        the instant the HORIZONTAL error closes -- with the whole descent still
+        outstanding. Guaranteed descent per attempt: zero.
+
+        It shipped at 0.12 against a 0.15 m tolerance. Five consecutive moves
+        each commanded a 0.12 m descent; net altitude change was -0.01 m. The
+        aircraft sat 0.50 m above the gate for the entire approach and lost
+        sight of it over the top.
+        """
+        self.assertGreater(self.cfg.vertical_step_m, self.cfg.arrival_tolerance_m)
+        guaranteed = self.cfg.vertical_step_m - self.cfg.arrival_tolerance_m
+        self.assertGreaterEqual(guaranteed, 0.05)
+
+    def test_a_config_that_could_never_descend_is_rejected_outright(self):
+        from navigation.missions.contracts import GateLegConfig
+
+        with self.assertRaises(ValueError) as caught:
+            GateLegConfig(vertical_step_m=0.12, arrival_tolerance_m=0.15)
+        self.assertIn("never change altitude", str(caught.exception))
+
+    def test_commit_tolerances_must_fit_the_airframe_through_the_gate(self):
+        from navigation.missions.contracts import GateLegConfig
+
+        # A 0.97 m gate with a 0.115 m airframe radius leaves 0.371 m usable.
+        GateLegConfig(commit_vertical_tol_m=0.35)          # fits
+        with self.assertRaises(ValueError) as caught:
+            GateLegConfig(commit_vertical_tol_m=0.45)      # does not
+        self.assertIn("usable half-opening", str(caught.exception))
 
     def test_the_commit_tolerances_were_NOT_loosened(self):
         # The gate is a 0.97155 m square. With a ~0.4 m airframe there is only
