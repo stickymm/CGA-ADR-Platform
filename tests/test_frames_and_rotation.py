@@ -199,6 +199,40 @@ class CircularMeanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             circular_mean_deg([])
 
+
+class CircularMedianTests(unittest.TestCase):
+    """The gate heading is filtered with a median, and headings wrap."""
+
+    def test_the_median_does_not_collapse_across_the_wrap(self):
+        from navigation.missions.frames import circular_median_deg
+
+        # Straight median() of [179, -179, 180] is 179, not far off -- but the
+        # ordering is meaningless across the wrap and the answer is luck. Here
+        # the values are all within 1 degree of 180, so the answer must be too.
+        from navigation.navigation import wrap_pi
+
+        result = circular_median_deg([179.0, -179.0, 180.0])
+        self.assertLess(abs(wrap_pi(math.radians(result - 180.0))), math.radians(1.0))
+
+    def test_the_median_discards_an_outlier_instead_of_averaging_it_in(self):
+        from navigation.missions.frames import circular_median_deg
+
+        # The whole reason it is a median: one bad PnP yaw solve must not move
+        # the answer. A mean of these five is 15.6 degrees; the median is 11.
+        values = [10.0, 11.0, 12.0, 11.0, 34.0]
+        self.assertAlmostEqual(circular_median_deg(values), 11.0, places=6)
+
+    def test_the_median_matches_a_plain_median_away_from_the_wrap(self):
+        from navigation.missions.frames import circular_median_deg
+
+        self.assertAlmostEqual(circular_median_deg([10.0, 20.0, 30.0]), 20.0, places=6)
+
+    def test_the_median_rejects_an_empty_sequence(self):
+        from navigation.missions.frames import circular_median_deg
+
+        with self.assertRaises(ValueError):
+            circular_median_deg([])
+
     def test_averaging_detections_uses_a_circular_mean_for_angles(self):
         averaged = average_detections(
             [detection(yaw_deg=179.0, forward=3.0), detection(yaw_deg=-179.0, forward=1.0)]

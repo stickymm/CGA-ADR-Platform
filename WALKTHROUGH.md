@@ -671,11 +671,21 @@ side, which is precisely the geometry that clips a gate leg on an open-loop pass
 
 **Not committed and out of range → APPROACH.**
 ```python
-standoff_m = max(commit_distance_m, fix.range_m - step_size_m)   # shrink by 0.25 m
+standoff_m = max(commit_distance_m, fix.range_m - step_size_m)   # shrink by 0.35 m
 desired    = standoff_target(fix, standoff_m, envelope)           # on the gate's centre axis
-stepped    = limit_target_step(state, desired, 0.25)              # cap the 3-D displacement
+stepped    = limit_approach_step(state, desired, 0.35, 0.25)      # horizontal and vertical caps, SEPARATELY
 nav.move_to_target(stepped, label, max_speed_m_s=0.35, tolerance_m=0.15)
 ```
+
+The horizontal and vertical budgets are spent independently, so gate-height noise cannot
+eat the forward progress. With a single 3-D cap, 0.25 m steps delivered 0.14 m of range
+closure in flight — 56% efficient.
+
+Before any of this, the fix has been through the rolling **pose filter**: a 5-observation
+median over the gate's N, E, D *and* heading, re-derived into a `GateFix` by
+`frames.refix_to_pose` so the commit decision and the flown target read the same numbers.
+The gate does not move; its estimate spread 0.21 m / 0.58 m / 0.46 m / 3.9° across five
+observations, and unfiltered that is what the aircraft chases.
 
 **Wire.** `move_to_target` runs a 10 Hz proportional loop, `v = 1.2 × error` clamped to
 0.35 m/s, and on each tick both latches the setpoint **and** transmits it directly — so the
@@ -690,13 +700,15 @@ loop). Same values, so PX4 simply gets a fresher one.
 ```
 
 **Not committed but IN range → ALIGN.** `standoff_m = commit_distance_m` — move onto the
-centre axis at 1.0 m and re-check. Bounded at `max_align_attempts = 4`:
+centre axis at 1.8 m and re-check. Bounded at `max_align_attempts = 6`:
 ```
-[*] Gate 0: NO_COMMIT -- in range but never aligned after 4 corrections (lateral -0.42m > +/-0.20m)
+[*] Gate 0: NO_COMMIT -- in range but never aligned after 6 corrections (lateral -0.42m > +/-0.20m)
 ```
 
-**Committed** → must hold **3 consecutive frames**. A single failing frame resets the count
-to zero. A one-frame PnP glitch at 1 m is exactly the input this has to survive.
+**Committed** → must hold **3 consecutive frames**. A failing frame resets the count to
+zero, and so does a *missed* observation — "consecutive" has to mean consecutive, or a run
+can span a dropout and the recovery manoeuvres that follow it. A one-frame PnP glitch at
+1.8 m is exactly the input this has to survive.
 ```
     commit=YES | OK range= 0.94m | OK lat=+0.03m | OK vert=-0.06m | OK cone=  4.1deg
     commit gate held 1/3 consecutive frames
@@ -724,10 +736,32 @@ return along >= 0.80          # exit_clearance_m
 Asking whether the drone is within 0.15 m of a point *beyond* the gate is a stop-and-settle
 test applied to a fly-through manoeuvre — it cannot be satisfied while still moving.
 
+**Open-loop does not mean straight-line.** The velocity is decomposed about the gate's centre
+**axis**, with along-track and cross-track clamped *separately*:
+
+```python
+along   = (state.n - fix.n)*normal_n + (state.e - fix.e)*normal_e
+cross   = (state - fix) - along*normal          # perpendicular offset from the axis
+v_along = clamp(KP_POS * (pass_distance_m - along), ±cross_speed_m_s)
+v_cross = clamp(-KP_POS * cross,                    ±cross_speed_m_s * 0.6)
+```
+
+One shared clamp is what made the aircraft veer. Committing at 1.8 m with a 1.5 m pass
+distance gives a 3.3 m along-track error, so `KP_POS × 3.3 = 3.96` m/s is scaled to 0.45 —
+a factor of 8.8 — and the cross-track term, being part of the same vector, is scaled by the
+same 8.8. A 0.10 m offset commanded 0.014 m/s of correction. The drone flew straight from
+wherever it committed and arrived off-centre by however much it was off-centre at commit.
+Reserving cross-track its own budget gives the offset a 0.83 s time constant against ~4 s
+of flight to the plane: five time constants, so it is gone before it matters.
+
 ```
 [*] Crossing gate 0: target N=+2.77 E=+0.00 D=-1.44, 2.12m at 0.45m/s, budget 10.0s, clearance 0.80m
+    entering 0.18m off the gate axis; centring at up to 0.27m/s while flying through
+[*] Gate 0 AT THE PLANE: 0.02m off centre laterally, +0.03m vertically
 [*] Gate 0 CROSSED (past the plane by 0.80m)
 ```
+`AT THE PLANE` is the line to read after a flight: it is the only direct measurement of
+whether the aircraft actually went through the middle.
 Budget blown instead:
 ```
 [!] Crossing timed out after 10.0s; only +0.31m along the gate normal
@@ -1183,18 +1217,22 @@ Everything tunable, in one place. **CLI flag** column blank means source-edit on
 
 | Field | Default | CLI | Controls |
 |---|---|---|---|
-| `commit_distance_m` | 1.00 m | `--commit-distance-m` | Range term of the commit gate; also the ALIGN standoff |
-| `step_size_m` | 0.25 m | `--step-size-m` | Max 3-D displacement per approach step |
+| `commit_distance_m` | 1.80 m | `--commit-distance-m` | Range term of the commit gate; also the ALIGN standoff. **1.80, not 1.00**: measured range stopped closing at ~1.72 m in flight, so 1.00 m was unreachable |
+| `step_size_m` | 0.35 m | `--step-size-m` | **Horizontal** displacement cap per approach step |
+| `vertical_step_m` | 0.25 m | `--vertical-step-m` | Vertical cap, budgeted separately. **Must be > `arrival_tolerance_m`** (validated) |
 | `arrival_tolerance_m` | 0.15 m | `--arrival-tolerance-m` | Arrival test for approach steps. **Must be < `step_size_m`** (validated) |
 | `approach_speed_m_s` | 0.35 m/s | `--approach-speed-m-s` | Speed cap for approach/align/back-off |
-| `observation_duration_s` | 0.50 s | `--observation-duration-s` | Sampling window |
-| `max_approach_attempts` | 14 | `--max-approach-attempts` | Observations before NO_COMMIT |
-| `approach_timeout_s` | 90 s | `--approach-timeout-s` | Hard per-gate deadline |
+| `observation_duration_s` | 0.80 s | `--observation-duration-s` | Sampling window |
+| `min_observation_samples` | 3 | `--min-observation-samples` | Thinner window is a miss, not a lock |
+| `gate_pose_filter_samples` | 5 | `--gate-pose-filter-samples` | Rolling median window over gate N, E, D **and heading** |
+| `max_approach_attempts` | 24 | `--max-approach-attempts` | Observations before NO_COMMIT |
+| `approach_timeout_s` | 150 s | `--approach-timeout-s` | Hard per-gate deadline |
 | `commit_lateral_tol_m` | 0.20 m | `--commit-lateral-tol-m` | Body-frame lateral term |
 | `commit_vertical_tol_m` | 0.25 m | `--commit-vertical-tol-m` | Body-frame vertical term |
+| `airframe_clearance_radius_m` | 0.115 m | `--airframe-clearance-radius-m` | Half the airframe box. Caps the two commit tolerances at the usable half-opening (validated) |
 | `commit_max_cone_deg` | 60° | `--commit-max-cone-deg` | Edge-on rejection |
-| `commit_confirm_frames` | 3 | `--commit-confirm-frames` | Consecutive passes required |
-| `max_align_attempts` | 4 | — | Align corrections before NO_COMMIT |
+| `commit_confirm_frames` | 3 | `--commit-confirm-frames` | Consecutive passes required. A **missed** observation resets the streak |
+| `max_align_attempts` | 6 | — | Align corrections before NO_COMMIT |
 | `pass_distance_m` | 1.50 m | `--pass-distance-m` | Open-loop target beyond the gate |
 | `exit_clearance_m` | 0.80 m | `--exit-clearance-m` | Crossing completion. **Must be < `pass_distance_m`** |
 | `cross_speed_m_s` | 0.45 m/s | `--cross-speed-m-s` | Speed cap while crossing |
@@ -1229,7 +1267,7 @@ Everything tunable, in one place. **CLI flag** column blank means source-edit on
 
 | Field | Default | CLI | Notes |
 |---|---|---|---|
-| `takeoff_alt_m` | 1.5 m | `--takeoff-altitude-m` | Must lie inside `[min, max]` |
+| `takeoff_alt_m` | 1.35 m | `--takeoff-altitude-m` | Must lie inside `[min, max]`. 1.35, not 1.50: the gate centre measures 1.06–1.09 m AGL |
 | `min_alt_m` | 0.8 m | `--min-altitude-m` | The floor. Every commanded `d` is clamped |
 | `max_alt_m` | 2.5 m | `--max-altitude-m` | The ceiling |
 | `d_takeoff` | latched | — | Set at the pad from `LOCAL_POSITION_NED.z` |

@@ -21,6 +21,7 @@ UNITS
 """
 
 import math
+from statistics import median
 from typing import Iterable, Sequence, Tuple
 
 from ..navigation import (
@@ -101,6 +102,119 @@ def circular_mean_deg(values: Iterable[float]) -> float:
         raise ValueError("circular_mean_deg requires at least one value")
 
     return rad_to_deg(math.atan2(sin_sum / count, cos_sum / count))
+
+
+def circular_median_deg(values: Sequence[float]) -> float:
+    """Median of angles in degrees, correct across the +/-180 wrap.
+
+    Same wrap problem as :func:`circular_mean_deg` -- ``median(179, -179)`` is
+    ``0``, off by a full 180 degrees -- but a median rather than a mean, because
+    the point of filtering the gate heading is to DISCARD a bad PnP yaw solve
+    rather than to blend it in.
+
+    Implemented by unwrapping every value into a continuous band around the most
+    recent one, taking the ordinary median there, and wrapping the answer back.
+    The most recent value is the reference on purpose: it is the sample most
+    likely to be near the current truth, so the band is centred where the data
+    actually is.
+
+    Returns:
+        The median direction in ``[-180, 180)``.  Raises ``ValueError`` if empty.
+    """
+    if not values:
+        raise ValueError("circular_median_deg requires at least one value")
+
+    reference = values[-1]
+    unwrapped = [
+        reference + rad_to_deg(wrap_pi(deg_to_rad(value - reference)))
+        for value in values
+    ]
+    return rad_to_deg(wrap_pi(deg_to_rad(median(unwrapped))))
+
+
+def refix_to_pose(
+    fix: GateFix,
+    state: VehicleState,
+    *,
+    n: float,
+    e: float,
+    d: float,
+    heading_rad: float,
+    envelope: AltitudeEnvelope,
+    max_cone_deg: float = 60.0,
+) -> GateFix:
+    """Rebuild a :class:`GateFix` at a filtered gate pose, re-deriving everything.
+
+    WHY EVERY DERIVED TERM IS RECOMPUTED RATHER THAN PATCHED
+        A ``GateFix`` carries the gate's position AND four quantities derived
+        from it -- ``range_m``, ``lateral_body_m``, ``vertical_body_m`` and
+        ``cone_angle_deg``.  The commit gate reads the derived ones; the
+        approach target reads the position.  Replacing the position while
+        leaving the derived fields alone makes those two disagree about where
+        the gate is, and the disagreement is invisible: the log prints both and
+        they look fine individually.
+
+        So this rebuilds all of them from the filtered pose and the pose the
+        vehicle was actually in.  After it, the decision to commit and the point
+        being flown to are the same measurement.
+
+    ``heading_rad`` is expected to come from headings that have ALREADY been
+    through :func:`resolve_gate_normal` -- ``GateFix.yaw_rad`` always has -- so
+    the normal is not re-resolved here.  Re-resolving would silently overwrite
+    ``normal_flipped``, which exists to make the detector's convention auditable
+    from a log.
+
+    LEVEL APPROXIMATION
+        The NED->body step uses yaw only.  These approaches fly within a couple
+        of degrees of level (roll and pitch logged at 0.3-1.4 degrees across the
+        whole of the 2026-08-14 flight), where the roll/pitch terms are under a
+        centimetre -- far below the noise on the quantities being filtered.  The
+        forward path in :func:`localize_gate` still uses the full 3-2-1
+        rotation, because there the lever arm is the raw range and the vehicle
+        may be accelerating hard.
+    """
+    clamped_d, was_clamped = clamp_altitude(d, envelope)
+
+    dn = n - state.n
+    de = e - state.e
+    dd = clamped_d - state.d
+
+    cos_yaw = math.cos(state.yaw_rad)
+    sin_yaw = math.sin(state.yaw_rad)
+    forward_body = dn * cos_yaw + de * sin_yaw
+    right_body = -dn * sin_yaw + de * cos_yaw
+
+    normal_n = math.cos(heading_rad)
+    normal_e = math.sin(heading_rad)
+    cone_deg = gate_cone_angle_deg(n, e, normal_n, normal_e, state.n, state.e)
+
+    reasons = []
+    if cone_deg > max_cone_deg:
+        reasons.append(f"edge-on ({cone_deg:.1f}deg > {max_cone_deg:.1f}deg)")
+    if was_clamped:
+        reasons.append(
+            f"altitude outside envelope (raw {altitude_agl(d, envelope):+.2f}m AGL)"
+        )
+
+    return GateFix(
+        n=n,
+        e=e,
+        d=clamped_d,
+        normal_n=normal_n,
+        normal_e=normal_e,
+        yaw_rad=math.atan2(normal_e, normal_n),
+        range_m=math.hypot(math.hypot(forward_body, right_body), dd),
+        lateral_body_m=right_body,
+        vertical_body_m=dd,
+        lateral_axis_m=lateral_offset_from_axis(
+            n, e, normal_n, normal_e, state.n, state.e
+        ),
+        cone_angle_deg=cone_deg,
+        normal_flipped=fix.normal_flipped,
+        altitude_clamped=was_clamped,
+        low_confidence=bool(reasons),
+        reason="; ".join(reasons),
+    )
 
 
 def resolve_gate_normal(

@@ -70,7 +70,15 @@ class AltitudeEnvelope:
     the envelope follows the EKF origin rather than assuming it is zero.
     """
 
-    takeoff_alt_m: float = 1.5
+    # 1.35 m, not 1.50 m. The gate this stack flies is a 0.97 m square whose
+    # centre has measured 1.06 - 1.09 m AGL on every flight, so a 1.50 m takeoff
+    # puts the aircraft ~0.42 m above the thing it is looking for before it has
+    # taken a single observation. It then has to descend the whole way while
+    # simultaneously closing range, and a gate seen from above is the geometry
+    # that leaves the top of the frame first. Starting near the gate's own
+    # height costs nothing and removes a whole axis of correction from the
+    # approach.
+    takeoff_alt_m: float = 1.35
     min_alt_m: float = 0.8
     max_alt_m: float = 2.5
     d_takeoff: float = 0.0
@@ -158,7 +166,42 @@ class GateLegConfig:
     # separate vertical budget raise the per-attempt yield, and a higher attempt
     # cap covers what is left. The deadline moves with them so the advertised
     # attempt count stays reachable -- see attempt_budget_s() below.
-    commit_distance_m: float = 1.0
+    #
+    # RAISED 1.00 -> 1.80 after the flight of 2026-08-14. 1.00 m was not merely
+    # hard to reach on this airframe: it was UNREACHABLE, and the log says so in
+    # a single column.
+    #
+    #     obs 2  drone (18.88, 1.77)  measured range 2.43 m
+    #     obs 3  drone (18.84, 1.42)  range 1.93 m   0.35 m flown, 0.50 m closed
+    #     obs 4  drone (18.93, 1.05)  range 1.72 m   0.38 m flown, 0.21 m closed
+    #     obs 5  drone (19.12, 0.65)  range 1.72 m   0.44 m flown, 0.00 m closed
+    #
+    # Closure was ~100% efficient from 2.8 m down to 1.9 m and then collapsed to
+    # nothing. That is the vision pipeline, not the navigator: a 0.97 m square at
+    # 1.7 m nearly fills the frame, the detector refuses any box touching an
+    # image edge -- hence the three consecutive misses immediately after obs 4 --
+    # and the corner estimates that do survive are clipped, so solvePnP returns a
+    # range that stops shrinking no matter how far the aircraft flies.
+    #
+    # A commit distance inside that wall means the leg can NEVER commit. It just
+    # keeps stepping; every step re-derives the target from a fresh fix; the
+    # aircraft wanders. That wandering is the "veering right" that ended the
+    # flight in an operator abort.
+    #
+    # So commit where the measurement is still good. At 1.80 m obs 3 and 4
+    # reported cone angles of 2.8 and 1.1 degrees from 18 and 19 averaged
+    # samples -- the best data of the whole approach.
+    #
+    # THE COST IS A LONGER BLIND LEG AND IT IS PAID FOR EXPLICITLY.
+    # The crossing is no longer a straight line to a point beyond the gate; it is
+    # an axis-following controller that drives cross-track error to zero DURING
+    # the pass (see gate_leg._fly_through_gate). Lateral error at the gate plane:
+    #     old, straight line committed at 1.0 m:  0.15 * 1.5/2.5    = 0.09 m
+    #     new, axis-following committed at 1.8 m: 0.20 * e^-(4/0.83) < 0.01 m
+    # plus the gate's own localization error in both cases. The two tolerances
+    # that actually keep a propeller out of a gate leg -- commit_lateral_tol_m
+    # and commit_vertical_tol_m -- are UNCHANGED.
+    commit_distance_m: float = 1.8
     step_size_m: float = 0.35
     approach_speed_m_s: float = 0.35
     # 0.8 s, not 0.5 s. The 0.5 s window produced as few as ONE usable sample in
@@ -189,20 +232,29 @@ class GateLegConfig:
     #   (step - tolerance) every attempt. __post_init__ enforces it.
     vertical_step_m: float = 0.25
 
-    # Rolling median window for the gate's estimated altitude.
+    # Rolling median window for the gate's estimated POSE -- north, east, down
+    # and heading, not just height.
     #
-    # The gate never moves, but its estimated height is the noisiest quantity in
-    # the pipeline: 0.46 m of spread across six observations of one stationary
-    # gate. Re-aiming at each raw value is the "keeps readjusting" behaviour --
-    # the aircraft chases noise instead of converging.
+    # It covered height alone until 2026-08-14, which fixed the vertical chase
+    # and left the horizontal one untouched. From that flight, six observations
+    # of one gate that never moved:
+    #
+    #     N   19.40  19.36  19.32  19.35  19.53     spread 0.21 m
+    #     E   -0.69  -0.60  -0.44  -0.62  -1.02     spread 0.58 m
+    #     hdg -75.7  -72.2  -72.7  -74.9  -71.8     spread  3.9 deg
+    #
+    # Every approach step is aimed at a standoff point derived from all four of
+    # those numbers, so unfiltered they inject roughly 0.2 m of target jitter at
+    # 1.8 m standoff and the aircraft chases it. Filtering height alone was half
+    # a fix.
     #
     # A MEDIAN, not a mean: it discards outliers rather than mixing them in.
-    # A ROLLING window, not an early lock: the far-range estimates are the
-    # WORST ones (a 0.97 m square subtends little at 3 m and the PnP scale is
-    # poorly conditioned), so freezing the first few would lock in the least
+    # A ROLLING window, not an early lock: the far-range estimates are the WORST
+    # ones (a 0.97 m square subtends little at 3 m and the PnP scale is poorly
+    # conditioned), so freezing the first few would lock in the least
     # trustworthy number available. It converges as the aircraft closes, which
     # is exactly when it matters.
-    gate_altitude_filter_samples: int = 5
+    gate_pose_filter_samples: int = 5
 
     # --- airframe geometry -------------------------------------------------
     # The camera reports where the GATE is. It has no idea how big the aircraft
@@ -235,7 +287,11 @@ class GateLegConfig:
     commit_vertical_tol_m: float = 0.25
     commit_max_cone_deg: float = 60.0
     commit_confirm_frames: int = 3
-    max_align_attempts: int = 4
+    # Raised 4 -> 6 alongside commit_distance_m. The ALIGN branch fires whenever
+    # the gate is in RANGE but not yet lined up, and moving that range gate from
+    # 1.0 m to 1.8 m means the aircraft enters ALIGN several steps earlier in the
+    # approach. The same four corrections now have to cover more of the flight.
+    max_align_attempts: int = 6
 
     # --- cross ---
     pass_distance_m: float = 1.5
@@ -298,8 +354,8 @@ class GateLegConfig:
 
         if self.min_observation_samples < 1:
             raise ValueError("min_observation_samples must be at least 1")
-        if self.gate_altitude_filter_samples < 1:
-            raise ValueError("gate_altitude_filter_samples must be at least 1")
+        if self.gate_pose_filter_samples < 1:
+            raise ValueError("gate_pose_filter_samples must be at least 1")
 
         # THE ONE THAT COST A FLIGHT. A vertical step inside the arrival
         # tolerance is a vertical step that never has to be flown.
@@ -441,8 +497,8 @@ def summarize_config(cfg: GateLegConfig) -> Tuple[Tuple[str, str], ...]:
                           f"descent guaranteed per attempt)"),
         ("arrival tolerance", f"{cfg.arrival_tolerance_m:.2f} m"),
         ("min samples per lock", f"{cfg.min_observation_samples}"),
-        ("gate altitude filter", f"median of {cfg.gate_altitude_filter_samples} "
-                                 f"observations"),
+        ("gate pose filter", f"median of {cfg.gate_pose_filter_samples} "
+                             f"observations (N, E, D and heading)"),
         ("airframe clearance", f"{cfg.airframe_clearance_radius_m:.3f} m radius; "
                                f"usable half-opening "
                                f"{cfg.gate_inner_size_m/2 - cfg.airframe_clearance_radius_m:.2f} m "

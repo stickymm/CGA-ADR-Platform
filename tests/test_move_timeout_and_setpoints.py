@@ -207,15 +207,55 @@ class ApproachBudgetAfterFirstFlightTests(unittest.TestCase):
             GateLegConfig(commit_vertical_tol_m=0.45)      # does not
         self.assertIn("usable half-opening", str(caught.exception))
 
-    def test_the_commit_tolerances_were_NOT_loosened(self):
+    def test_the_alignment_tolerances_were_NOT_loosened(self):
         # The gate is a 0.97155 m square. With a ~0.4 m airframe there is only
         # ~0.29 m of true clearance per side, so 0.20 / 0.25 m is already at the
         # limit. Making the approach easier must never come from making the
-        # decision to fly at a gate easier.
+        # decision to fly at a gate easier. These two, and the confirm count,
+        # are the terms that keep a propeller out of a gate leg.
         self.assertAlmostEqual(self.cfg.commit_lateral_tol_m, 0.20, places=9)
         self.assertAlmostEqual(self.cfg.commit_vertical_tol_m, 0.25, places=9)
-        self.assertAlmostEqual(self.cfg.commit_distance_m, 1.00, places=9)
         self.assertEqual(self.cfg.commit_confirm_frames, 3)
+
+    def test_the_commit_range_clears_the_wall_the_detector_hits(self):
+        """REGRESSION -- flight of 2026-08-14, and it cost the flight.
+
+        Measured range against distance flown, straight from the log:
+
+            obs 3  drone (18.84, 1.42)  range 1.93 m
+            obs 4  drone (18.93, 1.05)  range 1.72 m   0.38 m flown, 0.21 m closed
+            obs 5  drone (19.12, 0.65)  range 1.72 m   0.44 m flown, 0.00 m closed
+
+        Below roughly 1.7 m the 0.97 m gate fills the frame, the detector drops
+        every box touching an image edge, and the surviving PnP solve returns a
+        range that no longer shrinks. A commit distance inside that wall can
+        never be satisfied, so the leg steps forever and wanders while it does.
+        """
+        WALL_M = 1.72          # where measured closure went to zero
+        self.assertGreater(self.cfg.commit_distance_m, WALL_M)
+
+    def test_committing_further_out_still_fits_the_airframe_through_the_gate(self):
+        """The longer blind leg has to be paid for, not just accepted.
+
+        Cross-track error decays at 1/KP_POS during the pass because the
+        crossing controller reserves a separate speed budget for it, so what
+        arrives at the gate plane is the commit-time offset shrunk by five time
+        constants -- not carried across intact as a straight line would.
+        """
+        seconds_to_plane = self.cfg.commit_distance_m / self.cfg.cross_speed_m_s
+        decayed = self.cfg.commit_lateral_tol_m * math.exp(-KP_POS * seconds_to_plane)
+
+        usable = (
+            self.cfg.gate_inner_size_m / 2.0 - self.cfg.airframe_clearance_radius_m
+        )
+        # Leave room for the gate's own localization error on top.
+        self.assertLess(decayed + 0.15, usable)
+
+    def test_align_attempts_grew_with_the_range_that_triggers_aligning(self):
+        # ALIGN fires whenever the gate is in RANGE but not lined up. Moving
+        # that range gate outward means entering ALIGN earlier in the approach,
+        # so the same budget of corrections has to cover more of the flight.
+        self.assertGreaterEqual(self.cfg.max_align_attempts, 6)
 
 
 class TypeMaskTests(unittest.TestCase):

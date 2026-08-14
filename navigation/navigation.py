@@ -105,7 +105,13 @@ MAX_YAW_RATE_DEG_S = 45.0
 # MEASURE THESE. They are not derivable from anything and the previous values
 # were inherited from an abandoned prototype file. Tape measure, on the bench,
 # against the numbers STEP 3 prints.
-CAM_OFFSET_RIGHT_M = 0.0     # +ve = camera mounted LEFT of the reference (flies drone right)
+#   The RIGHT offset follows the identical derivation, and its comment said the
+#   opposite until 2026-08-14 -- the same inversion that cost three flights on
+#   the down axis, still sitting in the file one line above the fix for it.
+#   Camera at reference + c along body-right, gate at reference + g:
+#       det.right = g - c,  so  corrected = det.right + c = g  =>  offset = +c
+#   i.e. POSITIVE means the camera is mounted to the RIGHT of the reference.
+CAM_OFFSET_RIGHT_M = 0.0     # +ve = camera mounted RIGHT of the reference (flies drone right)
 CAM_OFFSET_DOWN_M = 0.10     # +ve = camera mounted BELOW the reference (flies drone lower)
 CAM_YAW_OFFSET_DEG = 0.0     # +ve = camera aims LEFT of the nose (yaws drone right)
 

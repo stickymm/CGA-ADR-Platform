@@ -117,12 +117,18 @@ class CommitAndCrossTests(unittest.TestCase):
     def test_a_failed_frame_resets_the_consecutive_commit_counter(self):
         # good, good, BAD, good, good, good -> the run of three only completes
         # after the bad frame, never across it.
+        #
+        # The pose filter is switched off here on purpose. It would median away
+        # the single bad frame -- which is exactly what it is for -- and this
+        # test is about the commit streak, not about the filter.
         mission = ScriptedMission(
             [COMMITTABLE, COMMITTABLE, IN_RANGE_UNALIGNED,
              COMMITTABLE, COMMITTABLE, COMMITTABLE]
         )
         outcome, log = run_leg(
-            self.nav, mission, leg_config(commit_confirm_frames=3), self.clock
+            self.nav, mission,
+            leg_config(commit_confirm_frames=3, gate_pose_filter_samples=1),
+            self.clock,
         )
 
         self.assertIs(outcome.result, GateResult.CROSSED)
@@ -156,6 +162,97 @@ class CommitAndCrossTests(unittest.TestCase):
     def test_the_crossing_leg_leaves_a_hold_behind(self):
         run_leg(self.nav, ScriptedMission([COMMITTABLE]), leg_config(), self.clock)
         self.assertTrue(any("after gate 0" in label for label in self.nav.holds))
+
+
+class CrossingCentresOnTheGateAxisTests(unittest.TestCase):
+    """The pass-through must go through the MIDDLE, not merely through.
+
+    REGRESSION -- flight of 2026-08-14, aborted by the operator because the
+    aircraft was tracking right into a gate leg.
+
+    The crossing used to be one proportional term toward a point beyond the gate
+    with a single clamp on the total speed. Committing at range R with a pass
+    distance L makes the along-track error R + L, so the clamp scales the whole
+    vector down by a large factor -- and the cross-track component is part of
+    that same vector, so it is scaled by the same factor. Centring authority
+    collapses and the aircraft flies a straight line from wherever it committed.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.nav = FakeNav(self.clock)
+        self.nav.integrate_velocity = True
+
+    def _cross_track_over_time(self, cfg, offset_right_m):
+        """Fly a crossing that starts off-axis; return the offset trace."""
+        # Gate dead ahead (normal +N), aircraft displaced along +E, which is
+        # body-right at yaw 0 -- the geometry of the aborted flight.
+        fix = gate_fix(n=1.8, e=0.0, d=-1.35, normal=(1.0, 0.0))
+        self.nav.set_state(n=0.0, e=offset_right_m, d=-1.35, yaw_rad=0.0)
+
+        trace = []
+        original = self.nav.get_vehicle_snapshot
+
+        def sampling_snapshot():
+            state = original()
+            trace.append(state.e - fix.e)   # perpendicular to the +N normal
+            return state
+
+        self.nav.get_vehicle_snapshot = sampling_snapshot
+        with patch.object(gate_leg, "time", self.clock):
+            crossed = gate_leg._fly_through_gate(
+                self.nav, fix, cfg, cfg.altitude, 0, log=RecordingLog()
+            )
+        return crossed, trace
+
+    def test_an_offset_at_commit_is_driven_out_before_the_gate_plane(self):
+        cfg = leg_config(commit_distance_m=1.8, pass_distance_m=1.5,
+                         exit_clearance_m=0.8)
+        crossed, trace = self._cross_track_over_time(cfg, offset_right_m=0.20)
+
+        self.assertTrue(crossed)
+        self.assertAlmostEqual(trace[0], 0.20, places=6)
+        # Whatever it was at commit, it is gone by the far side.
+        self.assertLess(abs(trace[-1]), 0.05, trace[-1])
+
+    def test_the_offset_shrinks_monotonically_rather_than_being_carried_across(self):
+        cfg = leg_config(commit_distance_m=1.8, pass_distance_m=1.5,
+                         exit_clearance_m=0.8)
+        _crossed, trace = self._cross_track_over_time(cfg, offset_right_m=0.20)
+
+        # Sampled every control period, so it must be strictly decreasing in
+        # magnitude -- no drift back out, no overshoot through zero.
+        for earlier, later in zip(trace, trace[1:]):
+            self.assertLessEqual(abs(later), abs(earlier) + 1e-9)
+        # Started at +0.20 and decayed toward the axis: it must never swing
+        # through to the far side, which is what an over-eager gain would do.
+        self.assertGreaterEqual(min(trace), -0.02, min(trace))
+
+    def test_the_old_single_clamp_would_have_carried_the_offset_through(self):
+        """The arithmetic of the defect, kept so nobody quietly reverts it.
+
+        Straight line from (-R, y0) to the exit point (+L, 0) crosses the gate
+        plane at y0 * L / (R + L) -- and that is the BEST case, with a perfect
+        gate estimate. The cross-track term never gets to act, because the
+        along-track error dominates the shared speed clamp.
+        """
+        R, L, y0 = 1.8, 1.5, 0.20
+        straight_line_offset = y0 * L / (R + L)
+        self.assertAlmostEqual(straight_line_offset, 0.0909, places=3)
+
+        cfg = leg_config(commit_distance_m=R, pass_distance_m=L, exit_clearance_m=0.8)
+        _crossed, trace = self._cross_track_over_time(cfg, offset_right_m=y0)
+        self.assertLess(abs(trace[-1]), straight_line_offset / 2.0)
+
+    def test_the_cross_track_offset_at_the_plane_is_logged(self):
+        # The single most useful number for debugging the next flight from a
+        # console log alone: did it actually go through the middle?
+        outcome, log = run_leg(
+            self.nav, ScriptedMission([COMMITTABLE]), leg_config(), self.clock
+        )
+        self.assertIs(outcome.result, GateResult.CROSSED)
+        self.assertTrue(log.contains("AT THE PLANE"))
+        self.assertTrue(log.contains("off centre"))
 
 
 class ApproachAndAlignTests(unittest.TestCase):
@@ -436,8 +533,8 @@ class RecoveryLadderTests(unittest.TestCase):
         self.assertLessEqual(len(self.nav.slews), 3 * 2)
 
 
-class GateAltitudeSteadyingTests(unittest.TestCase):
-    """The gate does not move. Its estimated height does, by 0.46 m."""
+class GatePoseSteadyingTests(unittest.TestCase):
+    """The gate does not move. Its estimate does, on all four axes."""
 
     def setUp(self):
         self.clock = FakeClock()
@@ -458,28 +555,83 @@ class GateAltitudeSteadyingTests(unittest.TestCase):
         steady = detection(forward=2.0, down=0.20, dist=2.0)
         outlier = detection(forward=2.0, down=0.80, dist=2.1)
         mission = ScriptedMission([steady, steady, steady, outlier, COMMITTABLE])
-        run_leg(self.nav, mission, leg_config(gate_altitude_filter_samples=5), self.clock)
+        run_leg(self.nav, mission, leg_config(gate_pose_filter_samples=5), self.clock)
 
         # The move issued right after the outlier must not have chased it.
         commanded_d = [target.d for _label, target, *_ in self.nav.moves]
         self.assertTrue(commanded_d)
         self.assertLess(max(commanded_d) - min(commanded_d), 0.30, commanded_d)
 
-    def test_the_filter_is_reported_so_it_is_never_invisible(self):
+    def test_an_outlier_LATERAL_position_does_not_move_the_target_either(self):
+        """REGRESSION -- flight of 2026-08-14, second half of the same defect.
+
+        The filter covered height alone, so the horizontal chase kept running.
+        The gate's east estimate spread 0.58 m across five observations of a gate
+        that never moved: -0.69, -0.60, -0.44, -0.62, -1.02.
+        """
+        steady = detection(forward=2.0, right=0.05, dist=2.0)
+        outlier = detection(forward=2.0, right=0.60, dist=2.1)
+        mission = ScriptedMission([steady, steady, steady, outlier, COMMITTABLE])
+        run_leg(self.nav, mission, leg_config(gate_pose_filter_samples=5), self.clock)
+
+        commanded = [(target.n, target.e) for _label, target, *_ in self.nav.moves]
+        self.assertTrue(commanded)
+        spread_e = max(e for _n, e in commanded) - min(e for _n, e in commanded)
+        self.assertLess(spread_e, 0.30, commanded)
+
+    def test_an_outlier_HEADING_does_not_swing_the_standoff_point(self):
+        # The standoff point is placed along the gate normal, so a bad PnP yaw
+        # moves the target sideways by standoff * sin(error) -- and PnP yaw on a
+        # near-planar square is the classic weakly-observable degree of freedom.
+        steady = detection(forward=2.0, yaw_deg=2.0, dist=2.0)
+        outlier = detection(forward=2.0, yaw_deg=35.0, dist=2.0)
+        mission = ScriptedMission([steady, steady, steady, outlier, COMMITTABLE])
+        run_leg(self.nav, mission, leg_config(gate_pose_filter_samples=5), self.clock)
+
+        commanded_yaw = [target.yaw_rad for _label, target, *_ in self.nav.moves]
+        self.assertTrue(commanded_yaw)
+        spread_deg = math.degrees(max(commanded_yaw) - min(commanded_yaw))
+        self.assertLess(spread_deg, 15.0, commanded_yaw)
+
+    def test_the_filter_reports_every_axis_so_it_is_never_invisible(self):
         steady = detection(forward=2.0, down=0.20, dist=2.0)
         outlier = detection(forward=2.0, down=0.90, dist=2.1)
         mission = ScriptedMission([steady, steady, outlier, COMMITTABLE])
         _outcome, log = run_leg(self.nav, mission, leg_config(), self.clock)
 
-        self.assertTrue(log.contains("altitude steadied"))
+        self.assertTrue(log.contains("pose steadied"))
+        for axis in ("dN=", "dE=", "dD=", "dHdg="):
+            self.assertIn(axis, log.text)
 
     def test_a_single_sample_window_is_the_raw_value(self):
         # Degenerate but legal: filtering over one sample changes nothing.
         mission = ScriptedMission([COMMITTABLE])
         _outcome, log = run_leg(
-            self.nav, mission, leg_config(gate_altitude_filter_samples=1), self.clock
+            self.nav, mission, leg_config(gate_pose_filter_samples=1), self.clock
         )
-        self.assertFalse(log.contains("altitude steadied"))
+        self.assertFalse(log.contains("pose steadied"))
+
+    def test_the_filtered_pose_and_the_commit_decision_never_disagree(self):
+        # A GateFix carries the gate position AND four quantities derived from
+        # it. The commit gate reads the derived ones; the approach target reads
+        # the position. Patching one without the other makes them describe
+        # different gates, and nothing in a log would show it.
+        from navigation.missions.frames import refix_to_pose
+        from navigation.missions.contracts import AltitudeEnvelope
+        from navigation.navigation import VehicleState
+
+        original = gate_fix(n=3.0, e=0.5, d=-1.5)
+        state = VehicleState(n=0.0, e=0.0, d=-1.4, yaw_rad=0.0)
+        moved = refix_to_pose(
+            original, state,
+            n=2.0, e=0.25, d=-1.4, heading_rad=0.0,
+            envelope=AltitudeEnvelope(), max_cone_deg=60.0,
+        )
+
+        # Derived terms follow the new pose rather than surviving from the old.
+        self.assertAlmostEqual(moved.lateral_body_m, 0.25, places=6)
+        self.assertAlmostEqual(moved.vertical_body_m, 0.0, places=6)
+        self.assertAlmostEqual(moved.range_m, math.hypot(2.0, 0.25), places=6)
 
 
 class ReturnToLastSightingTests(unittest.TestCase):

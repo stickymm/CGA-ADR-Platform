@@ -32,9 +32,8 @@ STATE MACHINE -- every state is bounded, every exit is named
 
 import math
 import time
-from dataclasses import replace
 from statistics import median
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from ..navigation import (
     LocalTarget,
@@ -49,16 +48,23 @@ from ..navigation import (
 from .contracts import GateFix, GateLegConfig, GateOutcome, GateResult
 from .frames import (
     backoff_target,
+    circular_median_deg,
     clamp_altitude,
     crossed_gate_plane,
     evaluate_commit,
     limit_approach_step,
     localize_gate,
     pass_through_target,
+    refix_to_pose,
     standoff_target,
 )
 
 LogFn = Callable[[str], None]
+
+# Share of ``cross_speed_m_s`` reserved for centring the aircraft on the gate
+# axis during the pass-through, held back from the along-track term so it can
+# never be squeezed out by it.  See _fly_through_gate for why that mattered.
+CROSS_TRACK_SPEED_FRACTION = 0.6
 
 
 def approach_and_cross_one_gate(
@@ -123,7 +129,8 @@ def approach_and_cross_one_gate(
     last_fix: Optional[GateFix] = None
     last_seen_state = None          # drone pose when the gate was last seen
     returned_to_last_seen = False
-    altitude_history: List[float] = []
+    # (n, e, d, heading_deg) per accepted observation; the rolling filter window.
+    pose_history: List[Tuple[float, float, float, float]] = []
 
     def finish(result: GateResult, reason: str) -> GateOutcome:
         log(f"[*] Gate {gate_index}: {result.value.upper()} -- {reason}")
@@ -187,6 +194,11 @@ def approach_and_cross_one_gate(
         # ---------------- SEARCH: the recovery ladder ----------------
         if detection is None:
             observe_failures += 1
+            # "N CONSECUTIVE frames" has to mean consecutive.  A miss used to
+            # leave the streak standing, so a run could span a dropout and the
+            # recovery manoeuvres that follow it -- committing on evidence
+            # gathered seconds earlier, from a pose the aircraft had since left.
+            confirmed_frames = 0
             log(f"[!] Gate {gate_index} not seen (miss {observe_failures})")
 
             if observe_failures <= cfg.max_observe_retries:
@@ -348,28 +360,44 @@ def approach_and_cross_one_gate(
                     )
                 continue
 
-        # ---------------- steady the gate's altitude ----------------
-        # The gate does not move; its estimated height does, by 0.46 m across
-        # six observations of one stationary gate in flight. Aiming at each raw
-        # value makes the aircraft chase noise instead of converging, and the
-        # vertical axis is where that costs the most -- too high and the gate
-        # leaves the top of the frame entirely.
+        # ---------------- steady the gate's POSE ----------------
+        # The gate does not move.  Its estimate does, on all four axes, across
+        # observations taken seconds apart in flight (2026-08-14):
         #
-        # The commit check is re-derived from the SAME filtered altitude, so the
-        # decision and the target can never disagree about where the gate is.
-        # (Level approximation: the body-frame vertical offset is the NED
-        # difference, exact at zero tilt and within a centimetre at the 1-2
-        # degrees these approaches actually fly.)
-        altitude_history.append(fix.d)
-        del altitude_history[: max(0, len(altitude_history) - cfg.gate_altitude_filter_samples)]
-        steady_d = median(altitude_history)
-        if abs(steady_d - fix.d) > 1e-9:
-            log(
-                f"    altitude steadied: raw d={fix.d:+.2f} -> median of "
-                f"{len(altitude_history)} = {steady_d:+.2f} "
-                f"({steady_d - fix.d:+.2f} m correction)"
+        #     N spread 0.21 m   E spread 0.58 m   D spread 0.46 m   hdg 3.9 deg
+        #
+        # Every approach target is a standoff point derived from all four, so
+        # unfiltered they inject roughly 0.2 m of target jitter at 1.8 m of
+        # standoff and the aircraft chases it instead of converging.  Filtering
+        # only the altitude -- which is what shipped on 2026-08-14 -- fixed the
+        # vertical chase and left the horizontal one running.
+        #
+        # The commit check is re-derived from the SAME filtered pose by
+        # refix_to_pose, so the decision and the target can never disagree about
+        # where the gate is.
+        pose_history.append((fix.n, fix.e, fix.d, math.degrees(fix.yaw_rad)))
+        del pose_history[: max(0, len(pose_history) - cfg.gate_pose_filter_samples)]
+        if len(pose_history) > 1:
+            raw = fix
+            fix = refix_to_pose(
+                fix,
+                state,
+                n=median([sample[0] for sample in pose_history]),
+                e=median([sample[1] for sample in pose_history]),
+                d=median([sample[2] for sample in pose_history]),
+                heading_rad=math.radians(
+                    circular_median_deg([sample[3] for sample in pose_history])
+                ),
+                envelope=envelope,
+                max_cone_deg=cfg.commit_max_cone_deg,
             )
-            fix = replace(fix, d=steady_d, vertical_body_m=steady_d - state.d)
+            log(
+                f"    pose steadied over {len(pose_history)} obs: "
+                f"dN={fix.n - raw.n:+.2f} dE={fix.e - raw.e:+.2f} "
+                f"dD={fix.d - raw.d:+.2f} "
+                f"dHdg={math.degrees(wrap_pi(fix.yaw_rad - raw.yaw_rad)):+.1f}deg "
+                f"| range {raw.range_m:.2f} -> {fix.range_m:.2f}m"
+            )
 
         last_fix = fix
         last_seen_state = state
@@ -553,7 +581,7 @@ def _fly_through_gate(
     *,
     log: LogFn = print,
 ) -> bool:
-    """Fly the frozen gate pose, completing on a plane crossing.
+    """Fly the frozen gate pose down its centre axis, completing on a plane crossing.
 
     The completion test is a signed projection onto the gate normal, NOT arrival
     within a position tolerance.  Asking whether the drone is within 0.10 m of a
@@ -562,24 +590,80 @@ def _fly_through_gate(
     failure on every run even when the crossing was perfect.  Combined with a
     fixed 15 s budget that a 2.5 m leg at 0.15 m/s cannot meet, that is why the
     old course mission announced success from an ignored ``False``.
+
+    WHY THE VELOCITY IS SPLIT INTO ALONG-TRACK AND CROSS-TRACK
+        This used to be one proportional term toward a point beyond the gate --
+        ``v = KP_POS * (target - state)`` -- with a single clamp on the total
+        speed.  That clamp is the bug.  Committing at 1.8 m with a 1.5 m pass
+        distance makes the along-track error 3.3 m, so ``KP_POS * 3.3 = 3.96``
+        m/s gets scaled to 0.45 m/s: a factor of 8.8.  The cross-track component
+        is scaled by the SAME factor, because it is part of the same vector.  A
+        0.10 m offset from the gate axis therefore commanded 0.014 m/s of
+        correction, which over the four seconds to the gate plane recovers
+        0.05 m of it.  The aircraft flew a straight line from wherever it
+        committed and arrived off-centre by however much it was off-centre at
+        commit -- observed on 2026-08-14 as a persistent drift to the right that
+        ended the flight in an operator abort.
+
+        Splitting the budget gives centring its own authority.  Along-track is
+        clamped to ``cross_speed_m_s`` on its own; cross-track and vertical each
+        get ``CROSS_TRACK_SPEED_FRACTION`` of that speed, reserved, and are
+        measured against the gate's centre AXIS rather than against the exit
+        point.  Cross-track error then decays with a time constant of
+        ``1 / KP_POS`` = 0.83 s against roughly 4 s of flight to the gate plane,
+        which is five time constants: whatever the offset was at commit, it is
+        gone by the time it matters.
+
+        Total commanded speed can therefore reach ``hypot(1, 0.6, 0.6)`` = 1.31x
+        ``cross_speed_m_s``.  That is intended and it is the same reasoning as
+        :func:`~navigation.missions.frames.limit_approach_step` -- it is the
+        progress being protected, not the vector magnitude -- and 0.59 m/s is
+        still far below anything the airframe minds.
     """
     target = pass_through_target(fix, cfg.pass_distance_m, envelope)
     state = nav.get_vehicle_snapshot()
     span = math.dist((state.n, state.e, state.d), (target.n, target.e, target.d))
     budget_s = estimate_move_timeout(span, cfg.cross_speed_m_s)
 
+    entry_along = (state.n - fix.n) * fix.normal_n + (state.e - fix.e) * fix.normal_e
+    entry_cross = math.hypot(
+        (state.n - fix.n) - entry_along * fix.normal_n,
+        (state.e - fix.e) - entry_along * fix.normal_e,
+    )
     log(
         f"[*] Crossing gate {gate_index}: target N={target.n:+.2f} E={target.e:+.2f} "
         f"D={target.d:+.2f}, {span:.2f}m at {cfg.cross_speed_m_s:.2f}m/s, "
         f"budget {budget_s:.1f}s, clearance {cfg.exit_clearance_m:.2f}m"
     )
+    log(
+        f"    entering {entry_cross:.2f}m off the gate axis; centring at up to "
+        f"{cfg.cross_speed_m_s * CROSS_TRACK_SPEED_FRACTION:.2f}m/s while flying through"
+    )
 
     period = 1.0 / POSITION_RATE_HZ
     started = time.time()
+    cross_budget = cfg.cross_speed_m_s * CROSS_TRACK_SPEED_FRACTION
+    plane_reported = False
 
     try:
         while nav.running:
             state = nav.get_vehicle_snapshot()
+
+            # Position decomposed about the gate's centre axis: how far along the
+            # direction of travel, and how far off the line.
+            along = (state.n - fix.n) * fix.normal_n + (state.e - fix.e) * fix.normal_e
+            cross_n = (state.n - fix.n) - along * fix.normal_n
+            cross_e = (state.e - fix.e) - along * fix.normal_e
+            cross_m = math.hypot(cross_n, cross_e)
+
+            # The one number that says whether this crossing went through the
+            # middle.  Printed once, at the moment the aircraft is in the gate.
+            if along >= 0.0 and not plane_reported:
+                plane_reported = True
+                log(
+                    f"[*] Gate {gate_index} AT THE PLANE: {cross_m:.2f}m off centre "
+                    f"laterally, {state.d - fix.d:+.2f}m vertically"
+                )
 
             if crossed_gate_plane(state.n, state.e, fix, cfg.exit_clearance_m):
                 log(f"[*] Gate {gate_index} CROSSED (past the plane by "
@@ -587,22 +671,30 @@ def _fly_through_gate(
                 return True
 
             if time.time() - started > budget_s:
-                along = (state.n - fix.n) * fix.normal_n + (state.e - fix.e) * fix.normal_e
                 log(
                     f"[!] Crossing timed out after {budget_s:.1f}s; "
                     f"only {along:+.2f}m along the gate normal"
                 )
                 return False
 
-            err_n = target.n - state.n
-            err_e = target.e - state.e
-            err_d = target.d - state.d
+            # Along-track: clamped on its own, so it cannot starve the others.
+            v_along = KP_POS * (cfg.pass_distance_m - along)
+            v_along = max(-cfg.cross_speed_m_s, min(cfg.cross_speed_m_s, v_along))
 
-            vn, ve, vd = KP_POS * err_n, KP_POS * err_e, KP_POS * err_d
-            speed = math.sqrt(vn * vn + ve * ve + vd * vd)
-            if speed > cfg.cross_speed_m_s:
-                scale = cfg.cross_speed_m_s / speed
-                vn, ve, vd = vn * scale, ve * scale, vd * scale
+            # Cross-track: drive the offset from the gate axis to zero, with a
+            # reserved share of the speed budget.
+            v_cross_n = -KP_POS * cross_n
+            v_cross_e = -KP_POS * cross_e
+            cross_speed = math.hypot(v_cross_n, v_cross_e)
+            if cross_speed > cross_budget:
+                scale = cross_budget / cross_speed
+                v_cross_n *= scale
+                v_cross_e *= scale
+
+            vn = v_along * fix.normal_n + v_cross_n
+            ve = v_along * fix.normal_e + v_cross_e
+            vd = KP_POS * (target.d - state.d)
+            vd = max(-cross_budget, min(cross_budget, vd))
 
             nav.set_setpoint(
                 Setpoint(

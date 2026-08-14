@@ -72,14 +72,28 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     flight = parser.add_argument_group("flight envelope")
-    flight.add_argument("--takeoff-altitude-m", type=float, default=1.5)
+    flight.add_argument(
+        "--takeoff-altitude-m",
+        type=float,
+        default=1.35,
+        help="1.35, not 1.50: the gate centre measures 1.06-1.09 m AGL, and "
+             "starting 0.4 m above it means descending the whole approach",
+    )
     flight.add_argument("--min-altitude-m", type=float, default=0.8)
     flight.add_argument("--max-altitude-m", type=float, default=2.5)
     flight.add_argument("--approach-speed-m-s", type=float, default=0.35)
     flight.add_argument("--cross-speed-m-s", type=float, default=0.45)
 
     gate = parser.add_argument_group("gate approach")
-    gate.add_argument("--commit-distance-m", type=float, default=1.0)
+    gate.add_argument(
+        "--commit-distance-m",
+        type=float,
+        default=1.8,
+        help="range term of the commit gate. 1.8, not 1.0: the measured range "
+             "stopped closing at ~1.7 m in flight (the gate fills the frame and "
+             "solvePnP saturates), so 1.0 m was unreachable and the leg could "
+             "never commit",
+    )
     gate.add_argument("--commit-lateral-tol-m", type=float, default=0.20)
     gate.add_argument("--commit-vertical-tol-m", type=float, default=0.25)
     gate.add_argument("--commit-max-cone-deg", type=float, default=60.0)
@@ -137,11 +151,14 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
              "MPC_YAWRAUTO_MAX for this -- fast yaw degrades optical flow",
     )
     gate.add_argument(
+        "--gate-pose-filter-samples",
+        # Kept working: this was --gate-altitude-filter-samples until the filter
+        # grew to cover N, E and heading as well as height.
         "--gate-altitude-filter-samples",
         type=int,
         default=5,
-        help="rolling median window for the gate height, so the aircraft stops "
-             "re-aiming at per-observation noise",
+        help="rolling median window for the gate's position AND heading, so the "
+             "aircraft stops re-aiming at per-observation noise",
     )
     limits.add_argument("--max-observe-retries", type=int, default=3)
     limits.add_argument("--max-scan-sweeps", type=int, default=2,
@@ -260,7 +277,7 @@ def build_leg_config(args, envelope: AltitudeEnvelope) -> GateLegConfig:
         max_detection_age_s=args.max_detection_age_s,
         arrival_tolerance_m=args.arrival_tolerance_m,
         vertical_step_m=args.vertical_step_m,
-        gate_altitude_filter_samples=args.gate_altitude_filter_samples,
+        gate_pose_filter_samples=args.gate_pose_filter_samples,
         airframe_clearance_radius_m=args.airframe_clearance_radius_m,
         crossed_gate_avoid_m=args.crossed_gate_avoid_m,
         min_observation_samples=args.min_observation_samples,
